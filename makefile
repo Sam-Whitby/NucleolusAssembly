@@ -1,39 +1,36 @@
-PROGRAM = run_hier
-#PROGRAM = run_crosstalk
-#PROGRAM = run_custom
-
-
-
-HEADERS = ./src
-SRC_DIR := ./src
-OBJ_DIR := ./obj
+HEADERS  = ./src
+SRC_DIR  := ./src
+OBJ_DIR  := ./obj
 SRC_FILES := $(wildcard $(SRC_DIR)/*.cpp)
 OBJ_FILES := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(SRC_FILES))
 
-FLAGS =   -std=c++11 -O3 -MMD
-CXX := g++
+FLAGS  = -std=c++11 -O3 -MMD
+CXX   := g++
 
-EXECUTABLE=./$(PROGRAM) 
+# Default builds both thesis simulation binaries
+all: run_nucleolus run_condensate
 
-
-all: $(EXECUTABLE) #run
-
-
-$(PROGRAM): $(PROGRAM).o $(OBJ_FILES)
-	$(CXX) $(FLAGS) -o  $(PROGRAM) $^ -I$(HEADERS) 
-
-$(PROGRAM).o: $(PROGRAM).cpp 
-	$(CXX) -c $(FLAGS) $(PROGRAM).cpp -I$(HEADERS)
-
-
-# Compile source code
-# see https://stackoverflow.com/questions/2908057/can-i-compile-all-cpp-files-in-src-to-os-in-obj-then-link-to-binary-in
+# Compile all src/*.cpp → obj/*.o
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
-	$(CXX) $(FLAGS) -c -o $@ $<
+	$(CXX) $(FLAGS) -c -o $@ $< -I$(HEADERS)
 
+run_nucleolus: run_nucleolus.o $(OBJ_FILES)
+	$(CXX) $(FLAGS) -o run_nucleolus $^ -I$(HEADERS)
 
-run: $(EXECUTABLE)
-	$(EXECUTABLE)
+run_nucleolus.o: run_nucleolus.cpp
+	$(CXX) -c $(FLAGS) run_nucleolus.cpp -I$(HEADERS)
+
+run_condensate: run_condensate.o $(OBJ_FILES)
+	$(CXX) $(FLAGS) -o run_condensate $^ -I$(HEADERS)
+
+run_condensate.o: run_condensate.cpp
+	$(CXX) -c $(FLAGS) run_condensate.cpp -I$(HEADERS)
+
+run_hier: run_hier.o $(OBJ_FILES)
+	$(CXX) $(FLAGS) -o run_hier $^ -I$(HEADERS)
+
+run_hier.o: run_hier.cpp
+	$(CXX) -c $(FLAGS) run_hier.cpp -I$(HEADERS)
 
 run_custom: run_custom.o $(OBJ_FILES)
 	$(CXX) $(FLAGS) -o run_custom $^ -I$(HEADERS)
@@ -47,17 +44,9 @@ run_polymer: run_polymer.o $(OBJ_FILES)
 run_polymer.o: run_polymer.cpp
 	$(CXX) -c $(FLAGS) run_polymer.cpp -I$(HEADERS)
 
-run_nucleolus: run_nucleolus.o $(OBJ_FILES)
-	$(CXX) $(FLAGS) -o run_nucleolus $^ -I$(HEADERS)
-
-run_nucleolus.o: run_nucleolus.cpp
-	$(CXX) -c $(FLAGS) run_nucleolus.cpp -I$(HEADERS)
-
 clean:
-	rm -f *.o  $(OBJ_DIR)/*.o *.d $(OBJ_DIR)/*.d
+	rm -f *.o $(OBJ_DIR)/*.o *.d $(OBJ_DIR)/*.d \
+	      run_nucleolus run_condensate run_hier run_custom run_polymer
 
-# see https://stackoverflow.com/questions/2908057/can-i-compile-all-cpp-files-in-src-to-os-in-obj-then-link-to-binary-in
-# see http://make.mad-scientist.net/papers/advanced-auto-dependency-generation/
-#CXXFLAGS += -MMD
 -include $(OBJ_FILES:.o=.d)
 

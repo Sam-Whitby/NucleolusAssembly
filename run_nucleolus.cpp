@@ -362,21 +362,10 @@ static int checkAndReplace(NucleolusModel& model,
 
     int nReplaced = 0;
     for (auto& comp : components) {
-        if ((int)comp.size() != N0) {
-            // Only full-complex-sized connected components are candidates
-            // (partial groups of free polymers also exit; remove any where
-            //  all particles have x > L_col to maintain steady state)
-            // Check if ALL particles in this component have x > L_col
-            bool allPast = true;
-            for (int gi : comp)
-                if (particles[gi].position[0] <= (double)L_col) { allPast = false; break; }
-            if (!allPast) continue;
-        } else {
-            bool allPast = true;
-            for (int gi : comp)
-                if (particles[gi].position[0] <= (double)L_col) { allPast = false; break; }
-            if (!allPast) continue;
-        }
+        bool allPast = true;
+        for (int gi : comp)
+            if (particles[gi].position[0] <= (double)L_col) { allPast = false; break; }
+        if (!allPast) continue;
 
         // Verify isolation: no edges to particles outside this component
         set<int> compSet(comp.begin(), comp.end());
