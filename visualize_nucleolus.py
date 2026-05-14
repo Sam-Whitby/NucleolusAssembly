@@ -32,7 +32,7 @@ import argparse
 import re
 import sys
 
-import matplotlib
+#import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.animation as animation
@@ -270,18 +270,24 @@ def main():
         scat.set_offsets(np.column_stack([xs, ys]))
         scat.set_color(colors)
 
-        # Backbone bonds: consecutive ids within same copy, dist² ≤ 2.5
+        # Backbone bonds: consecutive ids within same polymer (skip inter-polymer
+        # crossings at pid%4==3) and same copy, using PBC-corrected y distance.
+        W = fr['W']
         for ln in bond_lines:
             ln.remove()
         bond_lines = []
         by_id = {p[0]: p for p in pts}
         for p in pts:
             pid, _, px, py, copy_ = p
+            if pid % 4 == 3:  # last bead of this polymer — next pid is a different polymer
+                continue
             nxt = by_id.get(pid + 1)
             if nxt and nxt[4] == copy_:
-                dist2 = (nxt[2] - px)**2 + (nxt[3] - py)**2
-                if dist2 < 2.5:
-                    ln, = ax_anim.plot([px, nxt[2]], [py, nxt[3]],
+                dx = nxt[2] - px
+                dy = nxt[3] - py
+                dy -= W * round(dy / W)  # minimum-image y (periodic boundary)
+                if dx*dx + dy*dy < 2.5:
+                    ln, = ax_anim.plot([px, px + dx], [py, py + dy],
                                        color=_BACKBONE_COLOR, lw=_BOND_LW, zorder=2)
                     bond_lines.append(ln)
 

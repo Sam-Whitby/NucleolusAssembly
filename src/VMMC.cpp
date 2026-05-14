@@ -917,12 +917,8 @@ namespace vmmc
                     // Make sure link hasn't been tested already.
                     if (!particles[neighbour].isMoving)
                     {
-                        // SL mode: if a particle of the same type is already in the cluster,
-                        // treat this neighbour as environment (do not link it in).
-                        if (isSLMove && slN0 > 1 && slTypeInCluster[(int)neighbour % slN0])
-                            continue;
-
-                        // Pre-move pair energy.
+                        // Pre-move pair energy (must be computed before SL check so that
+                        // backbone bonds can bypass the SL type-filter below).
 #ifndef ISOTROPIC
                         double initialEnergy = callbacks.pairEnergyCallback(particle,
                             &particles[particle].preMovePosition[0], &particles[particle].preMoveOrientation[0],
@@ -931,6 +927,14 @@ namespace vmmc
                         double initialEnergy = callbacks.pairEnergyCallback(particle, &particles[particle].preMovePosition[0],
                             neighbour, &particles[neighbour].preMovePosition[0]);
 #endif
+
+                        // SL mode: if a particle of the same type is already in the cluster,
+                        // treat this neighbour as environment (do not link it in).
+                        // Backbone bonds (energy << -500) are exempt: they must always be
+                        // evaluated to prevent polymers from being torn apart by SL moves.
+                        if (isSLMove && slN0 > 1 && slTypeInCluster[(int)neighbour % slN0]
+                            && initialEnergy > -500.0)
+                            continue;
 
                         // Post-move pair energy.
 #ifndef ISOTROPIC

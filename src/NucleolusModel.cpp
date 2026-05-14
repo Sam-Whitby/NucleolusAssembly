@@ -121,14 +121,15 @@ double NucleolusModel::computePairEnergy(
         double backbone = interactions.east[particle1].getVal(particle2);
         if (backbone == Neighbours::cNone)
             backbone = interactions.east[particle2].getVal(particle1);
-        if (backbone != Neighbours::cNone)
-            energy += backbone;            // backbone: NOT scaled
-        else
+        if (backbone != Neighbours::cNone) {
+            energy += backbone;            // backbone only: do NOT add weak coupling.
+            // Adding weakDsq2 here would give identical energy to d=1 (both ≈ -992),
+            // making VMMC link weight = 0 and allowing backbone partners to separate.
+        } else {
             energy += interactions.crosstalk;
-
-        // Weak dsqrt2 coupling SCALED.
-        if (!interactions.weakDsq2.empty())
-            energy += g * interactions.weakDsq2[id1][id2];
+            if (!interactions.weakDsq2.empty())
+                energy += g * interactions.weakDsq2[id1][id2];
+        }
 
     } else if (normSqd < 4.0 + TOL) {
         // --- Distance 2 ---
