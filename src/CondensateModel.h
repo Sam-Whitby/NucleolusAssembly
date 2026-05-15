@@ -76,6 +76,11 @@ public:
     //! System energy excluding particles currently in the injection zone.
     //! Use this for plots and statistics; the VMMC uses the full energy.
     double getEnergyExcludingCore();
+
+    //! Full system pair-energy sum with no exclusions.
+    //! Use this for all energy reporting; avoids discontinuous jumps when
+    //! particles cross the injection-zone exclusion boundary.
+    double getSystemEnergy();
 };
 
 #endif /* _CONDENSATE_MODEL_H */

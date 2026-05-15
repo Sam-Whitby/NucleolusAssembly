@@ -10,7 +10,7 @@ annealing schedule.  Two condensate geometries are provided:
 | Binary | Geometry | Description |
 |---|---|---|
 | `run_nucleolus` | Column (rectangular) | Thesis model: linear gradient along x-axis, periodic y, open at x > L. |
-| `run_condensate` | Circular | Extension: radial gradient γ(r) = r/R_c, hard wall at centre, open at r > R_c with immediate re-placement. |
+| `run_condensate` | Circular | Extension: radial gradient γ(r), hard wall at centre and ring, open at r > R_c with queue-based ring injection. |
 
 ---
 
@@ -30,7 +30,7 @@ for visualisation.
 
 ### Target complex T
 
-Both simulations model 4 copies of the same 16-particle target complex T.
+Both simulations model multiple copies of the same 16-particle target complex T.
 Each copy consists of 4 polymers × 4 segments arranged on a 4×4 grid following
 the n = 2 Moore (space-filling) curve, partitioned into quadrants:
 
@@ -41,15 +41,21 @@ Polymer 0: (0,0)(1,0)(1,1)(0,1)  │  Polymer 1: (2,0)(3,0)(3,1)(2,1)
 ```
 
 Global particle id = copy × 16 + local id (0–15).  Local id determines both
-polymer membership (local id / 4) and segment position within that polymer
-(local id % 4).
+polymer membership (`local_id / 4`) and segment position within that polymer
+(`local_id % 4`).
 
 ### Backbone bonds
 
 Consecutive segments within each polymer are connected by a strong backbone
 bond (energy ≈ −1000, independent of the chemical gradient).  Backbone bonds
-are valid at distances d = 1 and d = √2 (diagonal), and are used as rigid
+are valid at distances d = 1 and d = √2 (diagonal), and act as rigid
 connectors — they should never break during a simulation.
+
+The backbone energy at d = √2 is set to −1000 (slightly stronger than −992
+at d = 1, where same-type weak coupling adds −8).  This ensures that moving
+a backbone-bonded pair from d = 1 to d = √2 is energetically favourable,
+so VMMC readily recruits backbone partners into the same cluster, preserving
+the chain topology.
 
 ### Weak coupling (Gō model)
 
@@ -74,9 +80,13 @@ multiplied by:
 
 **Column model:** g = γ(x_i) · γ(x_j),   γ(x) = min(x/L, 1)
 
-**Circular model:** g = γ(r_i) · γ(r_j),   γ(r) = min(r/R_c, 1)   (default `--coupling product`)
+**Circular model:** g = γ(r_i) · γ(r_j),   γ(r) = γ₀ + (1−γ₀)·r/R_c, clipped to [0, 1]   (default `--coupling product`)
 
 or with `--coupling midpoint`:  g = γ(|(pos_i + pos_j)/2 − centre|)
+
+`γ₀` (set via `--gamma0`, default 0) is the minimum coupling at the condensate
+centre.  With γ₀ = 0, coupling is fully suppressed at r = 0 and reaches 1 at
+r = R_c.  With γ₀ > 0, coupling is partially active even at the centre.
 
 Near the condensate core coupling is suppressed (denaturing conditions);
 full coupling is reached at x ≥ L or r ≥ R_c (physiological conditions).
@@ -136,13 +146,13 @@ After the cluster is assembled, the move is accepted by:
 
    ```
    ΔE = E_new − E_old
-   
+
    E_old = Σ_{cluster i, env j} J(i_old, j_old)
          + Σ_{cluster i < cluster j} J(i_old, j_old)
-   
+
    E_new = Σ_{cluster i, env j} J(i_new, j_old)
          + Σ_{cluster i < cluster j} J(i_new, j_old)
-   
+
    p_accept = min(1, exp(−ΔE))
    ```
 
@@ -264,49 +274,102 @@ real time.  Close the window or press Ctrl+C to stop.
 ### Geometry
 
 ```
-        × ← centre (r=0, hard-wall forbidden)
-       ···
-      ·····
-     ·······  ← R_c (condensate edge)
-      ·····
-       ···
-
-Particles diffuse outward from centre driven by the radial gradient.
-When an isolated component exits at r > R_c, its particles are
-immediately re-placed as denatured chains near the centre.
+        × ← centre (r=0)
+       N·E   ← injection ring (N, E, S, W — hard wall)
+      S···W
+     ·········  ← R_c (condensate edge, open boundary)
+      ·······
+       ·····
 ```
 
-The condensate centre is at (cx, cy) = (R_large, R_large) in a large
-non-periodic box (both x and y are aperiodic).  The centre site itself
-is hard-wall forbidden via the VMMC boundary callback.
+The condensate is centred at (cx, cy) = (R_large, R_large) inside a large
+non-periodic box, where R_large = max(6 R_c, 150).  The radial gradient
+γ(r) = γ₀ + (1−γ₀)·r/R_c suppresses weak coupling near the centre.
 
-### Removal and replacement
+**Hard-wall zone:** the centre (r = 0) and its four cardinal neighbours
+(r² < 1.5 lattice units²) are forbidden to all VMMC moves.  This ring of
+5 sites is reserved for injection and is enforced via the VMMC boundary
+callback.
 
-After every outer iteration, a BFS is run.  Any isolated component with all
-particles satisfying r > R_c is immediately re-placed:
+**Staging area:** polymers waiting for injection are held at
+x ≈ cx + 0.3·BOX (well outside R_c) in a fixed grid of slots.  Each
+polymer has a unique slot determined by its polymer key
+(copy × 4 + polymer_within_copy), so different polymers never share a slot.
+Staged particles are frozen by the boundary callback (all VMMC moves are
+rejected) to prevent drift-induced slot collisions.
 
-- Its particles are split into polymer groups by backbone connectivity
-  (global_id / N0 × N_POLYMER + (global_id % N0) / N_SEG).
-- Each polymer group (4 particles) is placed as a horizontal chain, searching
-  outward from (cx + 1) for free lattice sites.
-- Complete assembled complexes (exactly 16 particles) increment the exited
-  counter; partial assemblies are recycled transparently.
+### Three simulation phases
 
-This immediate replacement (rather than a queue) ensures that recycled
-particles are never double-counted and do not interact spuriously with the
-in-condensate assembly while waiting for injection.
-
-### Simulation phases
-
-The simulation runs three sequential phases (all in outer iterations):
+The simulation runs three sequential phases (all measured in outer iterations):
 
 | Phase | Flag | Default | Coupling | Purpose |
 |---|---|---|---|---|
-| Equilibration | `--t-equil N` | 0 | g = 1 everywhere | Let initially assembled complexes relax/diffuse. |
-| Denaturation | `--t-denat N` | 0 | g = 0 everywhere | Break complexes into denatured chains. |
-| Main | `--steps N` | 10000 | Radial gradient (or g=1 if `--gradient` not set) | Assembly / annealing run. |
+| Equilibration | `--t-equil N` | 0 | g = 1 everywhere | Let initially assembled complexes relax and begin circulating. |
+| Denaturation | `--t-denat N` | 0 | g = 0 everywhere | Break all complexes into denatured polymer chains. |
+| Main | `--steps N` | 10000 | Radial gradient (or g = 1 if `--gradient` not set) | Assembly / annealing run with gradient active. |
 
-The system **starts with `--copies` fully assembled target complexes** arranged in a square grid near the condensate centre, spaced 3 lattice units apart (no inter-complex interactions).  `--snapshots` are distributed proportionally to each phase's duration.
+Snapshot frames are distributed proportionally to each phase's duration.
+
+The system **starts with `--copies` fully assembled target complexes** arranged
+in a square grid centred at (cx, cy), with 7-lattice-unit offsets between
+complexes (3-unit gap, beyond the √5 interaction range).
+
+### Exit detection
+
+After every VMMC outer iteration:
+
+1. A BFS is run over the interaction graph, excluding staged particles.  A
+   connected component qualifies for recycling if:
+   - All its particles lie at r > R_c.
+   - It is isolated: no non-zero, non-backbone-energy bonds connect it to any
+     non-staged particle outside the component.
+
+2. Qualifying components are counted:
+   - `exitedParticles` increments by the component size.
+   - `exitedPerfect` increments by 1 if the component has exactly 16 particles
+     with all 16 distinct local ids (0–15) — a perfectly assembled complex.
+
+3. Each qualifying component is split into polymer groups
+   (all particles sharing the same copy index and polymer-within-copy index).
+   Each group (typically 4 segments) is moved to its designated staging slot
+   and added to the injection queue.
+
+### Queue-based ring injection
+
+After exit detection, `tryInjectNext` is called once per outer iteration:
+
+1. Check whether all four cardinal ring sites — N = (cx, cy+1),
+   E = (cx+1, cy), S = (cx, cy−1), W = (cx−1, cy) — are free of
+   non-staged particles.
+2. If free and the queue is non-empty, take the next polymer group from the
+   front of the queue.
+3. Choose a random starting ring position (0–3) and a random direction
+   (CW or CCW).
+4. Place segment s at ring position `(start ± s) mod 4`.  Consecutive
+   segments land at d = √2 from each other (diagonal ring neighbours),
+   so their backbone bonds are immediately active at −1000.
+5. Remove the injected particles from the staged set; they are now normal
+   condensate particles free to diffuse.
+
+At most one polymer (4 segments) is injected per outer iteration.  If the
+ring is occupied — because a recently injected polymer has not yet diffused
+outward — injection is deferred to the next iteration.
+
+### Energy reporting
+
+All energy values reported in trajectory and statistics files are computed by
+`getSystemEnergy()`: the full pair-energy sum over all particles (including
+staged polymers in the staging area), with no exclusions.  This avoids the
+discontinuous jumps of ≈ 992 energy units that would occur if the injection
+zone were explicitly excluded from the sum.
+
+Expected energy values per phase:
+- **Equil (g = 1):** ≈ −992 per backbone bond (3 per polymer × 16 polymers)
+  plus all active weak couplings ≈ −47 800 to −48 000 for 4 copies.
+- **Denat (g = 0):** exactly −1000 per backbone bond = −48 000 for 4 copies
+  (48 backbone bonds total, no weak coupling).
+- **Main (gradient):** between the equil and denat values, evolving as
+  complexes assemble and recycle.
 
 ### Usage
 
@@ -318,18 +381,25 @@ The system **starts with `--copies` fully assembled target complexes** arranged 
 |---|---|---|
 | `--steps N` | 10000 | Main-phase outer iterations. |
 | `--snapshots N` | 1000 | Total trajectory frames across all phases. |
-| `--t-equil N` | 0 | Equilibration iterations (g=1 everywhere). |
-| `--t-denat N` | 0 | Denaturation iterations (g=0 everywhere). |
+| `--t-equil N` | 0 | Equilibration iterations (g = 1 everywhere). |
+| `--t-denat N` | 0 | Denaturation iterations (g = 0 everywhere). |
 | `--copies N` | 4 | Number of target complex copies. |
 | `--radius R` | 60 | Condensate radius in lattice units. |
-| `--gamma0 γ` | 0.0 | Minimum coupling at r=0; γ(r)=γ₀+(1−γ₀)·r/R_c. |
-| `--gradient` | off | Enable radial gradient (otherwise g=1 in main phase). |
-| `--stokes` | off | Stokes drag (recommended). |
-| `--coupling MODE` | product | Coupling mode: `product` or `midpoint`. |
+| `--gamma0 γ` | 0.0 | Minimum coupling at r = 0; γ(r) = γ₀ + (1−γ₀)·r/R_c. |
+| `--gradient` | off | Enable radial gradient (otherwise g = 1 in main phase). |
+| `--stokes` | off | Stokes drag: D ∝ 1/R (recommended). |
+| `--coupling MODE` | `product` | Coupling mode: `product` or `midpoint`. |
 | `--phi-sl φ` | 0.2 | Fraction of SL moves. |
 | `--phi-rot φ` | 0.2 | Fraction of rotation moves. |
 | `--output PREFIX` | `condensate` | Output prefix. |
 | `--seed S` | 1 | RNG seed (0 = hardware random, non-reproducible). |
+
+**Coupling modes:**
+- `product`: g = γ(r_i) × γ(r_j) — each particle is weighted by its own
+  position; matches the column-model formulation.
+- `midpoint`: g = γ(|midpoint − centre|) — the coupling depends on the
+  position between the two particles; removes the double-counting criticism
+  since both particles are at the same contact point.
 
 ### Example
 
@@ -348,10 +418,28 @@ The system **starts with `--copies` fully assembled target complexes** arranged 
 ```bash
 python3 visualize_condensate.py my_circle_traj.txt
 
-# Save to file:
+# Skip every other frame for speed:
+python3 visualize_condensate.py my_circle_traj.txt --skip 2
+
+# Save to MP4 (requires ffmpeg):
 python3 visualize_condensate.py my_circle_traj.txt \
-        --output my_circle.gif --fps 10
+        --output my_circle.mp4 --fps 10
+
+# Save to GIF (requires Pillow):
+python3 visualize_condensate.py my_circle_traj.txt \
+        --output my_circle.gif --fps 5
 ```
+
+The visualiser produces a 3-panel animated figure:
+- **Left:** particle positions inside the condensate, coloured by polymer type,
+  with a radial blue-gradient overlay showing γ(r) and the condensate boundary.
+  Backbone bonds are drawn as dark lines between connected segments.
+- **Top-right:** system energy E − E₀ vs simulation step (baseline-subtracted
+  so the first frame is at zero).
+- **Bottom-right:** cumulative exit counts — total particles exited (grey) and
+  perfect complexes exited (green) — vs simulation step.
+
+The frame annotation shows the current step, ΔE, exit counts, and phase label.
 
 ---
 
@@ -368,18 +456,29 @@ step=S energy=E [geometry and exit counters]
 ...   (N_particles rows per frame)
 ```
 
-Column model header: `step=S energy=E exitedParticles=P exitedPerfect=Q L=... W=... nCopies=...`  
-Circular model header: `step=S energy=E exitedParticles=P exitedPerfect=Q R_c=... cx=... cy=... nCopies=... coupling=... gamma0=... phase=...`
+Column model header:
+```
+step=S energy=E exitedParticles=P exitedPerfect=Q L=... W=... nCopies=...
+```
+
+Circular model header:
+```
+step=S energy=E exitedParticles=P exitedPerfect=Q R_c=... cx=... cy=...
+      nCopies=... coupling=... gamma0=... phase=...
+```
 
 `exitedParticles` — cumulative total particles that left (any isolated component).  
-`exitedPerfect` — cumulative perfectly assembled complexes (all 16 distinct local types).  
-`phase` — which simulation phase produced this frame: `equil`, `denat`, or `main`.
+`exitedPerfect` — cumulative perfectly assembled complexes (all 16 distinct local types present).  
+`phase` — which phase produced this frame: `equil`, `denat`, or `main`.
 
 ### `PREFIX_stats.txt` — scalar time series
 
 ```
 # step  energy  exitedParticles  exitedPerfect  acceptRatio  phase
 ```
+
+One row per saved frame; useful for plotting kinetics without loading the full
+trajectory.
 
 ---
 

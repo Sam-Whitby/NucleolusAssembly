@@ -50,6 +50,7 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <queue>
 #include <algorithm>
 
 #include "Demo.h"
@@ -201,12 +202,14 @@ static void placeParticlesTargetComplex(vector<Particle>& particles,
 
 // ============================================================
 //  Interaction-graph connected components (BFS over pair energy).
+//  Staged particles are entirely excluded from the graph.
 // ============================================================
 static int buildComponents(CondensateModel& model,
                             vector<Particle>& particles,
                             int nParticles,
                             vector<int>& fragmentID,
-                            vector<vector<int>>& components)
+                            vector<vector<int>>& components,
+                            const set<int>& staged)
 {
     fragmentID.assign(nParticles, -1);
     components.clear();
@@ -216,6 +219,7 @@ static int buildComponents(CondensateModel& model,
 
     for (int i = 0; i < nParticles; i++) {
         if (fragmentID[i] != -1) continue;
+        if (staged.count(i)) continue;
         vector<int> comp = {i};
         fragmentID[i] = nfrag;
 
@@ -226,6 +230,7 @@ static int buildComponents(CondensateModel& model,
             for (int k = 0; k < nn; k++) {
                 int nbr = (int)nbrs[k];
                 if (fragmentID[nbr] != -1) continue;
+                if (staged.count(nbr)) continue;
                 double e = model.computePairEnergy(
                     j,   &particles[j].position[0],   &particles[j].orientation[0],
                     nbr, &particles[nbr].position[0], &particles[nbr].orientation[0]);
@@ -242,28 +247,36 @@ static int buildComponents(CondensateModel& model,
 }
 
 // ============================================================
-//  Check exit condition and immediately re-place exiting particles.
+//  Detect exiting isolated components, count exits, move to
+//  staging area, and enqueue for later ring injection.
 //
-//  Any isolated component with all particles at r > R_c is recycled.
+//  Any isolated component (no non-staged neighbours outside the
+//  component) with all particles at r > R_c is "exited".
+//  Its particles are grouped by polymer, moved to stageX0, added
+//  to staged, and pushed onto injQueue.
+//
 //  Returns {totalParticlesExited, perfectComplexesExited}.
-//  A "perfect complex" has exactly N0 particles with all N0 distinct
-//  local ids (0..N0-1), confirming correct assembly.
 // ============================================================
-static pair<int,int> checkAndReplace(CondensateModel& model,
-                                      vector<Particle>& particles,
-                                      int nParticles,
-                                      CellList& cells, Box& box,
-                                      double cx, double cy, double R_c,
-                                      vmmc::VMMC& vmmc)
+static pair<int,int> handleExitsAndQueue(
+    CondensateModel& model,
+    vector<Particle>& particles,
+    int nParticles,
+    CellList& cells, Box& box,
+    double cx, double cy, double R_c,
+    vmmc::VMMC& vmmc,
+    queue<vector<int>>& injQueue,
+    set<int>& staged,
+    int stageX0)
 {
     vector<int> fragmentID;
     vector<vector<int>> components;
-    buildComponents(model, particles, nParticles, fragmentID, components);
+    buildComponents(model, particles, nParticles, fragmentID, components, staged);
 
     int particlesExited = 0;
     int perfectExited   = 0;
     const int maxInt = 30;
     unsigned int nbrs[maxInt];
+    int icy = (int)round(cy);
 
     for (auto& comp : components) {
         bool allOut = true;
@@ -282,6 +295,7 @@ static pair<int,int> checkAndReplace(CondensateModel& model,
             for (int k = 0; k < nn; k++) {
                 int nbr = (int)nbrs[k];
                 if (compSet.count(nbr)) continue;
+                if (staged.count(nbr)) continue;
                 double e = model.computePairEnergy(
                     gi,  &particles[gi].position[0],  &particles[gi].orientation[0],
                     nbr, &particles[nbr].position[0], &particles[nbr].orientation[0]);
@@ -300,58 +314,98 @@ static pair<int,int> checkAndReplace(CondensateModel& model,
             if ((int)localIds.size() == N0) perfectExited++;
         }
 
-        // Re-place particles as denatured chains near the condensate centre.
-        vector<int> sorted_comp = comp;
-        sort(sorted_comp.begin(), sorted_comp.end());
-
-        set<int> replSet(sorted_comp.begin(), sorted_comp.end());
-        set<pair<int,int>> occ;
-        for (int i = 0; i < nParticles; i++) {
-            if (replSet.count(i)) continue;
-            occ.insert({(int)round(particles[i].position[0]),
-                        (int)round(particles[i].position[1])});
-        }
-
-        int icx = (int)round(cx);
-        int icy = (int)round(cy);
-
+        // Group by polymer key and stage each polymer group.
         map<int, vector<int>> groups;
-        for (int gi : sorted_comp) {
+        for (int gi : comp) {
             int key = (gi / N0) * N_POLYMER + (gi % N0) / N_SEG;
             groups[key].push_back(gi);
         }
 
         for (auto& kv : groups) {
+            int polyKey = kv.first;
             auto& gids = kv.second;
             sort(gids.begin(), gids.end(),
-                 [](int a, int b){ return (a % N0) < (b % N0); });
+                 [](int a, int b){ return (a % N_SEG) < (b % N_SEG); });
 
-            bool placed = false;
-            for (int dx = 1; dx <= 200 && !placed; dx++) {
-                for (int dy = -50; dy <= 50 && !placed; dy++) {
-                    int x0 = icx + dx, y0 = icy + dy;
-                    bool free = true;
-                    for (int s = 0; s < (int)gids.size() && free; s++)
-                        if (occ.count({x0 + s, y0})) free = false;
-                    if (!free) continue;
-
-                    for (int s = 0; s < (int)gids.size(); s++) {
-                        int gi = gids[s];
-                        particles[gi].position[0] = x0 + s;
-                        particles[gi].position[1] = y0;
-                        box.periodicBoundaries(particles[gi].position);
-                        int newCell = cells.getCell(particles[gi]);
-                        cells.updateCell(newCell, particles[gi], particles);
-                        vmmc.syncPosition(gi, &particles[gi].position[0]);
-                        occ.insert({x0 + s, y0});
-                    }
-                    placed = true;
-                }
+            // Move to staging area: horizontal chain at stageX0, unique y per polymer.
+            int stageY = icy + polyKey * 2;
+            for (int s = 0; s < (int)gids.size(); s++) {
+                int gi = gids[s];
+                particles[gi].position[0] = stageX0 + s;
+                particles[gi].position[1] = stageY;
+                box.periodicBoundaries(particles[gi].position);
+                int newCell = cells.getCell(particles[gi]);
+                cells.updateCell(newCell, particles[gi], particles);
+                vmmc.syncPosition(gi, &particles[gi].position[0]);
+                staged.insert(gi);
             }
+            injQueue.push(gids);
         }
     }
 
     return {particlesExited, perfectExited};
+}
+
+// ============================================================
+//  If all 4 cardinal ring sites around (cx,cy) are unoccupied
+//  by non-staged particles, place the next queued polymer on
+//  the ring in a random CW or CCW orientation.
+//
+//  Ring order (CW): N=(cx,cy+1), E=(cx+1,cy), S=(cx,cy-1), W=(cx-1,cy).
+//  Segment s of the polymer goes to ring[(start ± s) % 4].
+// ============================================================
+static void tryInjectNext(
+    vector<Particle>& particles,
+    int nParticles,
+    CellList& cells, Box& box,
+    vmmc::VMMC& vmmc,
+    double cx, double cy,
+    queue<vector<int>>& injQueue,
+    set<int>& staged)
+{
+    if (injQueue.empty()) return;
+
+    int icx = (int)round(cx);
+    int icy = (int)round(cy);
+
+    // Ring positions CW: N, E, S, W.
+    pair<int,int> ring[4] = {
+        {icx,   icy+1},
+        {icx+1, icy  },
+        {icx,   icy-1},
+        {icx-1, icy  }
+    };
+
+    // All 4 ring positions must be free of non-staged particles.
+    for (int ri = 0; ri < 4; ri++) {
+        for (int gi = 0; gi < nParticles; gi++) {
+            if (staged.count(gi)) continue;
+            double dx = particles[gi].position[0] - ring[ri].first;
+            double dy = particles[gi].position[1] - ring[ri].second;
+            if (fabs(dx) < 0.5 && fabs(dy) < 0.5) return;
+        }
+    }
+
+    vector<int>& gids = injQueue.front();
+    sort(gids.begin(), gids.end(),
+         [](int a, int b){ return (a % N_SEG) < (b % N_SEG); });
+
+    int  start = (int)(vmmc.rng() * 4) % 4;
+    bool cw    = vmmc.rng() < 0.5;
+
+    for (int s = 0; s < (int)gids.size(); s++) {
+        int ringIdx = cw ? (start + s) % 4 : (start - s + 4) % 4;
+        int gi = gids[s];
+        particles[gi].position[0] = ring[ringIdx].first;
+        particles[gi].position[1] = ring[ringIdx].second;
+        box.periodicBoundaries(particles[gi].position);
+        int newCell = cells.getCell(particles[gi]);
+        cells.updateCell(newCell, particles[gi], particles);
+        vmmc.syncPosition(gi, &particles[gi].position[0]);
+        staged.erase(gi);
+    }
+
+    injQueue.pop();
 }
 
 // ============================================================
@@ -528,6 +582,11 @@ int main(int argc, char** argv)
     bool   isRepulsive         = true;
     int    nLatticeNeighbours  = 8;
 
+    // Queue-based injection state — declared before callbacks so they can be captured.
+    queue<vector<int>> injQueue;
+    set<int>           staged;
+    int stageX0 = (int)round(cx + BOX * 0.3);
+
     using namespace std::placeholders;
     vmmc::CallbackFunctions callbacks;
     callbacks.energyCallback =
@@ -540,10 +599,15 @@ int main(int argc, char** argv)
         std::bind(&CondensateModel::applyPostMoveUpdates, &model, _1, _2, _3);
 
     callbacks.boundaryCallback =
-        [cx, cy](unsigned int, const double* pos, const double*) -> bool {
+        [cx, cy, &staged](unsigned int pid, const double* pos, const double*) -> bool {
             double dx = pos[0] - cx;
             double dy = pos[1] - cy;
-            return (dx*dx + dy*dy) < 0.5;
+            // Hard wall: centre + 4 cardinal sites are forbidden for all particles.
+            if (dx*dx + dy*dy < 1.5) return true;
+            // Staged particles are frozen: reject any VMMC move proposal.
+            // This prevents drift that would cause staging-slot collisions.
+            if (staged.count((int)pid)) return true;
+            return false;
         };
 
     vmmc::VMMC vmmc(nParticles, dimension, coordinates.data(), orientations.data(),
@@ -569,7 +633,7 @@ int main(int argc, char** argv)
     fprintf(fp_stat, "# step  energy  exitedParticles  exitedPerfect  acceptRatio  phase\n");
 
     // Write step-0 frame (assembled, phase=equil or main depending on what follows).
-    double initEnergy = model.getEnergyExcludingCore();
+    double initEnergy = model.getSystemEnergy();
     string firstPhase = (t_equil > 0) ? "equil" : (t_denat > 0) ? "denat" : "main";
     writeFrame(fp_traj, particles, nCopies, R_c, cx, cy,
                0, initEnergy, 0, 0, couplingStr, gamma0, firstPhase);
@@ -586,13 +650,15 @@ int main(int argc, char** argv)
         cout << "--- Phase: " << phaseName << "  (" << phaseSteps << " steps) ---" << endl;
         for (long long s = 1; s <= phaseSteps; s++) {
             vmmc += nParticles;
-            pair<int,int> exitResult = checkAndReplace(model, particles, nParticles,
-                                                        cells, box, cx, cy, R_c, vmmc);
+            pair<int,int> exitResult = handleExitsAndQueue(model, particles, nParticles,
+                                                            cells, box, cx, cy, R_c, vmmc,
+                                                            injQueue, staged, stageX0);
             totalParticlesExited += exitResult.first;
             totalPerfectExited   += exitResult.second;
+            tryInjectNext(particles, nParticles, cells, box, vmmc, cx, cy, injQueue, staged);
             globalStep++;
 
-            double energy      = model.getEnergyExcludingCore();
+            double energy      = model.getSystemEnergy();
             double acceptRatio = (double)vmmc.getAccepts() / (double)vmmc.getAttempts();
 
             bool doSave = (s % saveEveryN == 0) || (s == phaseSteps);

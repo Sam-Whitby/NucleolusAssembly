@@ -191,6 +191,25 @@ double CondensateModel::computeEnergy(
     return energy;
 }
 
+double CondensateModel::getSystemEnergy()
+{
+    double energy = 0.0;
+    int np = (int)particles.size();
+    for (int i = 0; i < np; i++) {
+        unsigned int nbrs[maxInteractions];
+        unsigned int n = computeInteractions(i, &particles[i].position[0],
+                                             &particles[i].orientation[0], nbrs);
+        for (unsigned int k = 0; k < n; k++) {
+            unsigned int nbr = nbrs[k];
+            energy += computePairEnergy(i, &particles[i].position[0],
+                                        &particles[i].orientation[0],
+                                        nbr, &particles[nbr].position[0],
+                                        &particles[nbr].orientation[0]);
+        }
+    }
+    return energy * 0.5;
+}
+
 double CondensateModel::getEnergyExcludingCore()
 {
     double energy = 0.0;
