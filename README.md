@@ -196,12 +196,18 @@ After every outer iteration, a BFS is run over the interaction graph (edges
 where pair energy ≠ 0 and < 10⁵).  A connected component is removed and
 reinserted if:
 
-1. It contains exactly 16 particles (one complete assembled complex).
-2. All its particles satisfy x > L.
-3. It is isolated (no non-backbone bonds to particles outside the component).
+1. All its particles satisfy x > L.
+2. It is isolated (no non-backbone bonds to particles outside the component).
 
-The 16 particles are reinserted as 4 horizontal denatured polymer chains near
-x = 1, in the first free 4 × 4 block found scanning from x = 1 upward.
+There is no restriction on component size: lone particles, partial assemblies,
+and complete 16-particle complexes are all recycled.  Only complete 16-particle
+recyclings increment the exited counter.
+
+**Re-insertion (snake placement):** particles are grouped by polymer
+(local index / 4).  Each polymer chain (4 segments) is placed independently as
+a horizontal row in the first free slot, scanning y = 0 … W−1 for x = 1, 2, …
+before advancing x.  Successive chains pack as close to x = 0 as possible,
+filling the denaturing zone in a snake-like pattern.
 
 ### Usage
 
@@ -236,13 +242,20 @@ x = 1, in the first free 4 × 4 block found scanning from x = 1 upward.
 ### Visualisation
 
 ```bash
+# Watch the simulation as it runs (no file saved):
+python3 visualize_nucleolus.py my_column_traj.txt --live
+
+# Display completed trajectory interactively:
 python3 visualize_nucleolus.py my_column_traj.txt \
         --gradient-length 60 --width 10
 
-# Save to file:
+# Save to MP4 (much smaller and faster than GIF; requires ffmpeg):
 python3 visualize_nucleolus.py my_column_traj.txt \
-        --gradient-length 60 --output my_column.gif --fps 10
+        --gradient-length 60 --output my_column.mp4 --fps 10
 ```
+
+`--live` polls the trajectory file every ~0.5 s and updates the plot in
+real time.  Close the window or press Ctrl+C to stop.
 
 ---
 

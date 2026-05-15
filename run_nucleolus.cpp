@@ -240,9 +240,12 @@ static set<pair<int,int>> buildOccupancy(const vector<Particle>& particles)
 }
 
 // ============================================================
-//  Try to place a set of particle indices (globalIds, 16 particles)
-//  as 4 horizontal polymer chains near x=1.
-//  Returns true if successful, false if no space was found.
+//  Place a set of particle indices as horizontal polymer chains near x=1.
+//  Particles are grouped by polymer (gi/N_SEG) and each polymer chain is
+//  placed independently in the first free row, scanning y=0..W-1 for each
+//  x starting from 1.  This snake-packing keeps chains as close to x=0
+//  as possible and works for components of any size (not just 16).
+//  Returns true if all chains were placed, false if space ran out.
 // ============================================================
 static bool replacementPlacement(
     vector<Particle>& particles, CellList& cells, Box& box,
@@ -254,34 +257,39 @@ static bool replacementPlacement(
     set<pair<int,int>> occ;
     for (int i = 0; i < (int)particles.size(); i++) {
         if (replSet.count(i)) continue;
-        int px = (int)round(particles[i].position[0]);
-        int py = (int)round(particles[i].position[1]);
-        occ.insert({px, py});
+        occ.insert({(int)round(particles[i].position[0]),
+                    (int)round(particles[i].position[1])});
     }
 
-    // Try to place 4 horizontal chains of length 4 in a 4×4 block
-    // Search x from 1 upward, y from 0
-    for (int x0 = 1; x0 <= L_col; x0++) {
-        for (int y0 = 0; y0 < W; y0++) {
-            // Check if a 4-rows × 4-cols block is free
-            bool blockFree = true;
-            for (int p = 0; p < N_POLYMER && blockFree; p++) {
-                int y = (y0 + p) % W;
-                for (int s = 0; s < N_SEG && blockFree; s++) {
-                    if (occ.count({x0 + s, y})) blockFree = false;
-                }
-            }
-            if (!blockFree) continue;
+    // Sort ids by (polyId = gi/N_SEG, segIdx = gi%N_SEG) so consecutive
+    // entries in ids[] form complete, ordered polymer chains.
+    vector<int> ids = globalIds;
+    sort(ids.begin(), ids.end(), [](int a, int b) {
+        int pa = a / N_SEG, pb = b / N_SEG;
+        return pa != pb ? pa < pb : (a % N_SEG) < (b % N_SEG);
+    });
 
-            // Place 4 polymers as horizontal chains
-            for (int p = 0; p < N_POLYMER; p++) {
-                int y = (y0 + p) % W;
-                for (int s = 0; s < N_SEG; s++) {
-                    int gi = globalIds[p * N_SEG + s];
-                    double newX = (double)(x0 + s);
-                    double newY = (double)y;
-                    particles[gi].position[0] = newX;
-                    particles[gi].position[1] = newY;
+    // Place each polymer group (contiguous same-polyId range) as a horizontal
+    // chain in the first free row, scanning y first then x.
+    int i = 0;
+    while (i < (int)ids.size()) {
+        int polyId = ids[i] / N_SEG;
+        int j = i;
+        while (j < (int)ids.size() && ids[j] / N_SEG == polyId) j++;
+        int len = j - i;  // number of segments in this polymer
+
+        bool placed = false;
+        for (int x0 = 1; x0 <= L_col && !placed; x0++) {
+            for (int y0 = 0; y0 < W && !placed; y0++) {
+                bool free = true;
+                for (int s = 0; s < len && free; s++)
+                    if (occ.count({x0 + s, y0})) free = false;
+                if (!free) continue;
+
+                for (int s = 0; s < len; s++) {
+                    int gi = ids[i + s];
+                    particles[gi].position[0] = (double)(x0 + s);
+                    particles[gi].position[1] = (double)y0;
                     box.periodicBoundaries(particles[gi].position);
                     int newCell = cells.getCell(particles[gi]);
                     cells.updateCell(newCell, particles[gi], particles);
@@ -290,12 +298,15 @@ static bool replacementPlacement(
                     // displacements from the old (large-x) position, producing y values
                     // many box-lengths out of range that exceed VMMC's single-wrap PBC.
                     vmmc.syncPosition(gi, &particles[gi].position[0]);
+                    occ.insert({x0 + s, y0});
                 }
+                placed = true;
             }
-            return true;
         }
+        if (!placed) return false;
+        i = j;
     }
-    return false;  // no space available
+    return true;
 }
 
 // ============================================================
@@ -388,20 +399,10 @@ static int checkAndReplace(NucleolusModel& model,
         }
         if (!isolated) continue;
 
-        // Try to replace: comp must have exactly N0 particles (one complex worth)
-        // Only remove if the component size equals one full complex (16 particles)
-        // so that partial groups are not recycled individually (they will merge
-        // back into the next eligible component).
-        if ((int)comp.size() != N0) continue;
-
-        // Attempt placement at x ≈ 0
-        // Re-order comp so that polymer assignment is consistent with global ids
-        // (copy c, polymer p → particles c*N0 + p*N_SEG .. c*N0 + p*N_SEG + N_SEG-1)
-        // Just sort by global index so backbone pairing is preserved.
-        sort(comp.begin(), comp.end());
-
+        // Recycle any isolated component past x=L regardless of size.
+        // Count toward exits only if it is a complete N0-particle complex.
         if (replacementPlacement(particles, cells, box, comp, W, L_col, vmmc)) {
-            nReplaced++;
+            if ((int)comp.size() == N0) nReplaced++;
         }
     }
     return nReplaced;
