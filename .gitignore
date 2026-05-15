@@ -1,21 +1,23 @@
 # Compiled binaries
+run_nucleolus
+run_condensate
 run_hier
 run_custom
 run_polymer
-run_crosstalk
 
-# Object and dependency files
+# Object files and dependency files
 *.o
 *.d
 obj/
 
-# Simulation output files
+# Simulation output
 *_traj.txt
 *_stats.txt
-*_init.conf
-*_polymer_bonds.txt
 *.gif
-*.png
+*.mp4
+
+# macOS
+.DS_Store
 
 # Python cache
 __pycache__/

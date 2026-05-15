@@ -434,6 +434,42 @@ static void writeFrame(FILE* fp, const vector<Particle>& particles,
 }
 
 // ============================================================
+//  Backbone bond diagnostic: returns number of backbone violations.
+//  A violation is any backbone pair with d > sqrt(2) + epsilon.
+// ============================================================
+static int checkBackboneBonds(const vector<Particle>& particles, Box& box,
+                               int nCopies, long long step,
+                               bool printDetails)
+{
+    int nViolations = 0;
+    for (int c = 0; c < nCopies; c++) {
+        int base = c * N0;
+        for (int k = 0; k < N_BB_PAIRS; k++) {
+            int gi = base + BACKBONE_PAIRS[k][0];
+            int gj = base + BACKBONE_PAIRS[k][1];
+            vector<double> sep(2);
+            sep[0] = particles[gi].position[0] - particles[gj].position[0];
+            sep[1] = particles[gi].position[1] - particles[gj].position[1];
+            box.minimumImage(sep);
+            double d = sqrt(sep[0]*sep[0] + sep[1]*sep[1]);
+            if (d > 1.5) {  // bonded states: d=1 or d=sqrt(2)~1.414; threshold 1.5
+                nViolations++;
+                if (printDetails) {
+                    fprintf(stderr,
+                        "[BACKBONE VIOLATION] step=%lld pair=(%d,%d) "
+                        "pos_i=(%.3f,%.3f) pos_j=(%.3f,%.3f) d=%.4f\n",
+                        step, gi, gj,
+                        particles[gi].position[0], particles[gi].position[1],
+                        particles[gj].position[0], particles[gj].position[1],
+                        d);
+                }
+            }
+        }
+    }
+    return nViolations;
+}
+
+// ============================================================
 //  main()
 // ============================================================
 int main(int argc, char** argv)
@@ -448,7 +484,7 @@ int main(int argc, char** argv)
     double phi_sl       = 0.2;
     double phi_rot      = 0.2;
     string outPrefix    = "nucleolus";
-    unsigned int seed   = 0;
+    unsigned int seed   = 1;  // default non-zero → always deterministic
 
     // --- Parse arguments ---
     for (int i = 1; i < argc; i++) {
@@ -555,7 +591,7 @@ int main(int argc, char** argv)
     double maxTrialRotation    = (phi_rot > 0.0) ? M_PI : 0.0;
     double probTranslate       = 1.0 - phi_rot;
     double referenceRadius     = 0.5;
-    bool   isRepulsive         = false;
+    bool   isRepulsive         = true;
     int    nLatticeNeighbours  = 8;   // 8 directions (including diagonals)
 
     using namespace std::placeholders;
@@ -585,8 +621,11 @@ int main(int argc, char** argv)
     // Stokes: set hydrAlpha = 0 to disable (unit diffusion), 1 to enable
     vmmc.hydrAlpha = useStokes ? 1.0 : 0.0;
 
-    // Set RNG seed
+    // Set RNG seed — always explicit so every run is deterministic.
+    // Pass --seed 0 to get a hardware-random seed (non-reproducible).
     if (seed != 0) vmmc.rng.setSeed(seed);
+    else { seed = std::random_device{}(); vmmc.rng.setSeed(seed); }
+    fprintf(stderr, "[SEED] %u\n", seed);
 
     // --- Open output files ---
     string trajFile  = outPrefix + "_traj.txt";
@@ -610,14 +649,56 @@ int main(int argc, char** argv)
     clock_t startTime = clock();
     long long totalExited = 0;
 
+    static int totalBBViolations = 0;
+    static bool firstViolationFound = false;
+    // Per-move BB check: enable fine-grained checking near first violation step.
+    // Set perMoveCheckStart to (first_violation_step - 200) to narrow the search.
+    const long long perMoveCheckStart = nsteps + 1;  // disabled; set to step-200 to debug violations
+
     for (long long step = 1; step <= nsteps; step++) {
-        // One outer iteration = nParticles VMMC move attempts
-        vmmc += nParticles;
+        // One outer iteration = nParticles VMMC move attempts.
+        // If close to the known first violation, check after every VMMC move.
+        if (!firstViolationFound && step >= perMoveCheckStart) {
+            for (int mv = 0; mv < nParticles; mv++) {
+                vmmc += 1;
+                int v = checkBackboneBonds(particles, box, nCopies, step, false);
+                if (v > 0) {
+                    firstViolationFound = true;
+                    fprintf(stderr, "[DIAG] First backbone violation: outer_step=%lld inner_move=%d count=%d\n",
+                            step, mv, v);
+                    checkBackboneBonds(particles, box, nCopies, step, true);
+                    // Finish remaining moves normally
+                    vmmc += (nParticles - mv - 1);
+                    break;
+                }
+            }
+        } else {
+            vmmc += nParticles;
+        }
+
+        // Backbone bond diagnostic after VMMC (outer-step summary).
+        int vAfterVmmc = checkBackboneBonds(particles, box, nCopies, step, false);
+        if (vAfterVmmc > 0 && !firstViolationFound) {
+            firstViolationFound = true;
+            fprintf(stderr, "[DIAG] First backbone violation after VMMC, step=%lld count=%d\n", step, vAfterVmmc);
+            checkBackboneBonds(particles, box, nCopies, step, true);
+        }
+        totalBBViolations += vAfterVmmc;
 
         // Check for isolated components past x=L; remove and replace
         int nExited = checkAndReplace(model, particles, cells, box,
                                        nCopies, W, L_col, vmmc);
         totalExited += nExited;
+
+        // Backbone bond check: detect violations introduced by checkAndReplace.
+        if (!firstViolationFound) {
+            int vAfterReplace = checkBackboneBonds(particles, box, nCopies, step, false);
+            if (vAfterReplace > 0) {
+                firstViolationFound = true;
+                fprintf(stderr, "[DIAG] First backbone violation from checkAndReplace, step=%lld count=%d\n", step, vAfterReplace);
+                checkBackboneBonds(particles, box, nCopies, step, true);
+            }
+        }
 
         double energy      = model.getEnergy() * nParticles;
         double acceptRatio = (double)vmmc.getAccepts() / (double)vmmc.getAttempts();
@@ -641,6 +722,7 @@ int main(int argc, char** argv)
 
     double simTime = (clock() - startTime) / (double)CLOCKS_PER_SEC;
     cout << "Done! Time = " << simTime << " s (" << simTime/60 << " min)" << endl;
+    cout << "Total backbone violations (outer-step snapshots): " << totalBBViolations << endl;
     cout << "Total exited complexes: " << totalExited << endl;
     cout << "Acceptance ratio: "
          << (double)vmmc.getAccepts() / (double)vmmc.getAttempts() << endl;

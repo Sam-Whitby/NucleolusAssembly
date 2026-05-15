@@ -521,60 +521,83 @@ namespace vmmc
         double energy;
         double excessEnergy = 0;
 
-        // Construct pair interaction matrix (finite repulsions only).
+        // Pre-move cluster-environment energy (thesis step 7: full Metropolis acceptance).
+        // Sums J(i_old, j_old) for all cluster member i / environment member j pairs.
+        double E_old = 0.0;
         if (isRepusive)
         {
-            unsigned int x, y;
-            unsigned int nPairs;
             unsigned int pairInteractions[maxInteractions];
-
-            // Check all particles in the moving cluster.
             for (unsigned int i=0;i<nMoving;i++)
             {
-                // Get a list of pair interactions.
 #ifndef ISOTROPIC
-                nPairs = callbacks.interactionsCallback(moveList[i], &particles[moveList[i]].preMovePosition[0],
+                unsigned int nPairs = callbacks.interactionsCallback(moveList[i],
+                    &particles[moveList[i]].preMovePosition[0],
                     &particles[moveList[i]].preMoveOrientation[0], pairInteractions);
 #else
-                nPairs = callbacks.interactionsCallback(moveList[i],
+                unsigned int nPairs = callbacks.interactionsCallback(moveList[i],
                     &particles[moveList[i]].preMovePosition[0], pairInteractions);
 #endif
-
-                // Test all pair interactions.
                 for (unsigned int j=0;j<nPairs;j++)
                 {
+                    unsigned int nbr = pairInteractions[j];
+                    if (particles[nbr].isMoving) continue;  // skip cluster-cluster pairs
 #ifndef ISOTROPIC
-                    energy = callbacks.pairEnergyCallback(moveList[i],
-                        &particles[moveList[i]].preMovePosition[0], &particles[moveList[i]].preMoveOrientation[0],
-                        pairInteractions[j], &particles[pairInteractions[j]].preMovePosition[0],
-                        &particles[pairInteractions[j]].preMoveOrientation[0]);
+                    double pairE = callbacks.pairEnergyCallback(moveList[i],
+                        &particles[moveList[i]].preMovePosition[0],
+                        &particles[moveList[i]].preMoveOrientation[0],
+                        nbr, &particles[nbr].preMovePosition[0],
+                        &particles[nbr].preMoveOrientation[0]);
+                    E_old += pairE;
 #else
-                    energy = callbacks.pairEnergyCallback(moveList[i], &particles[moveList[i]].preMovePosition[0],
-                        pairInteractions[j], &particles[pairInteractions[j]].preMovePosition[0]);
+                    double pairE = callbacks.pairEnergyCallback(moveList[i],
+                        &particles[moveList[i]].preMovePosition[0],
+                        nbr, &particles[nbr].preMovePosition[0]);
+                    E_old += pairE;
 #endif
+                }
+            }
 
-                    x = moveList[i];
-                    y = pairInteractions[j];
-
-                    // Make sure leading index is larger.
-                    if (x < y)
+            // Cluster-cluster pair energies at pre-move positions.
+            // For position-dependent potentials (gamma-scaled bonds in NucleolusModel),
+            // cluster-cluster pair energies change when the cluster moves in x because
+            // gamma(x_i)*gamma(x_j) changes even though the inter-particle distance is preserved.
+            // These changes are NOT captured by the link-weight mechanism (which tests each bond
+            // treating the potential partner as stationary in the environment). They must be
+            // included in step-7 to satisfy detailed balance.
+            //
+            // For backbone bonds (not gamma-scaled), rigid-body moves preserve inter-particle
+            // distance exactly → E_old_cc(backbone) = E_new_cc(backbone) → they cancel in ΔE.
+            // Including them here is harmless; any non-zero numerical residual is caught by the
+            // hard-core check on E_new_cc.
+            if (nMoving > 1)
+            {
+                for (unsigned int a = 0; a < nMoving; a++)
+                {
+                    for (unsigned int b = a+1; b < nMoving; b++)
                     {
-                        x = y;
-                        y = moveList[i];
-                    }
-
-                    // Check to see if pair interaction has already been logged.
-                    if (pairEnergyMatrix[x][y] == 0)
-                    {
-                        interactions[nInteractions][0] = x;
-                        interactions[nInteractions][1] = y;
-                        nInteractions++;
-
-                        // Store pair energy.
-                        pairEnergyMatrix[x][y] = energy;
+#ifndef ISOTROPIC
+                        double pairE = callbacks.pairEnergyCallback(
+                            moveList[a], &particles[moveList[a]].preMovePosition[0],
+                            &particles[moveList[a]].preMoveOrientation[0],
+                            moveList[b], &particles[moveList[b]].preMovePosition[0],
+                            &particles[moveList[b]].preMoveOrientation[0]);
+#else
+                        double pairE = callbacks.pairEnergyCallback(
+                            moveList[a], &particles[moveList[a]].preMovePosition[0],
+                            moveList[b], &particles[moveList[b]].preMovePosition[0]);
+#endif
+                        E_old += pairE;
                     }
                 }
             }
+        }
+
+        // Pre-move E_old overflow: pre-existing hard-core overlap makes E_old = INF,
+        // which causes excessEnergy = E_new - INF = -INF → exp(+INF) → always accept.
+        // Reject instead to preserve detailed balance.
+        if (E_old > 1e5) {
+            isEarlyExit = true;
+            return false;
         }
 
         // Check for non-pairwise energy contributions.
@@ -620,76 +643,85 @@ namespace vmmc
 #else
                 energy = callbacks.energyCallback(moveList[i], &particles[moveList[i]].preMovePosition[0]);
 #endif
-
-                // Overlap.
+                // Hard-core overlap.
                 if (energy > 1e6) return false;
             }
             else
             {
-                double x, y;
-                double pairEnergy;
+                // Post-move cluster-environment energy.
+                // After swapMoveStatus(), preMovePosition holds the NEW position for cluster members
+                // and the OLD position for environment members.
                 unsigned int pairInteractions[maxInteractions];
-
 #ifndef ISOTROPIC
-                unsigned int nPairs = callbacks.interactionsCallback(moveList[i], &particles[moveList[i]].preMovePosition[0],
+                unsigned int nPairs = callbacks.interactionsCallback(moveList[i],
+                    &particles[moveList[i]].preMovePosition[0],
                     &particles[moveList[i]].preMoveOrientation[0], pairInteractions);
 #else
                 unsigned int nPairs = callbacks.interactionsCallback(moveList[i],
                     &particles[moveList[i]].preMovePosition[0], pairInteractions);
 #endif
-
                 for (unsigned int j=0;j<nPairs;j++)
                 {
+                    unsigned int nbr = pairInteractions[j];
+                    if (particles[nbr].isMoving) continue;  // skip cluster-cluster pairs
 #ifndef ISOTROPIC
-                    energy = callbacks.pairEnergyCallback(moveList[i], &particles[moveList[i]].preMovePosition[0],
-                        &particles[moveList[i]].preMoveOrientation[0], pairInteractions[j],
-                        &particles[pairInteractions[j]].preMovePosition[0], &particles[pairInteractions[j]].preMoveOrientation[0]);
+                    energy = callbacks.pairEnergyCallback(moveList[i],
+                        &particles[moveList[i]].preMovePosition[0],
+                        &particles[moveList[i]].preMoveOrientation[0],
+                        nbr, &particles[nbr].preMovePosition[0],
+                        &particles[nbr].preMoveOrientation[0]);
 #else
-                    energy = callbacks.pairEnergyCallback(moveList[i], &particles[moveList[i]].preMovePosition[0],
-                        pairInteractions[j], &particles[pairInteractions[j]].preMovePosition[0]);
+                    energy = callbacks.pairEnergyCallback(moveList[i],
+                        &particles[moveList[i]].preMovePosition[0],
+                        nbr, &particles[nbr].preMovePosition[0]);
 #endif
-
-                    // Early exit test for hard core overlaps and large finite energy repulsions.
+                    // Hard-core overlap check.
                     if (energy > 1e6) return false;
+                    excessEnergy += energy;
+                }
+            }
+        }
 
-                    x = moveList[i];
-                    y = pairInteractions[j];
-
-                    if (x < y)
-                    {
-                        x = y;
-                        y = moveList[i];
-                    }
-
-                    // Repulsive interaction.
-                    if (energy > 0)
-                    {
-                        // Check that particles didn't previously interact.
-                        if (pairEnergyMatrix[x][y] == 0)
-                            excessEnergy += energy;
-                    }
-                    else
-                    {
-                        // Neighbour isn't part of the moving cluster.
-                        if (!particles[pairInteractions[j]].isMoving)
-                        {
-                            // Particles no longer interact.
-                            if (energy == 0)
-                            {
-                                pairEnergy = pairEnergyMatrix[x][y];
-
-                                // Particles previously felt a repulsive interaction.
-                                if (pairEnergy > 0)
-                                    excessEnergy -= pairEnergy;
-                            }
-                        }
-                    }
+        // Cluster-cluster pair energies at post-move positions (outside the per-member loop).
+        // After swapMoveStatus(), preMovePosition holds the NEW position for cluster members.
+        // Combined with E_old_cc (computed before swapMoveStatus above), this gives
+        // ΔE_cluster_cluster = E_new_cc - E_old_cc in excessEnergy for the Metropolis step.
+        //
+        // This also catches the BOTH-in-cluster backbone violation case: if two backbone
+        // partners are both in the cluster but clusterPosition inconsistency places them at
+        // d > sqrt(2)+eps after rotation, E_new_cc(backbone) = 0 vs E_old_cc(backbone) = -1000,
+        // giving ΔE = +1000 → rejection probability ≈ 1.
+        if (isRepusive && nMoving > 1)
+        {
+            for (unsigned int a = 0; a < nMoving; a++)
+            {
+                for (unsigned int b = a+1; b < nMoving; b++)
+                {
+#ifndef ISOTROPIC
+                    double pairE = callbacks.pairEnergyCallback(
+                        moveList[a], &particles[moveList[a]].preMovePosition[0],
+                        &particles[moveList[a]].preMoveOrientation[0],
+                        moveList[b], &particles[moveList[b]].preMovePosition[0],
+                        &particles[moveList[b]].preMoveOrientation[0]);
+#else
+                    double pairE = callbacks.pairEnergyCallback(
+                        moveList[a], &particles[moveList[a]].preMovePosition[0],
+                        moveList[b], &particles[moveList[b]].preMovePosition[0]);
+#endif
+                    // Hard-core overlap within cluster: should not occur for correct moves
+                    // (rigid-body preserves distances), but reject defensively.
+                    if (pairE > 1e6) return false;
+                    excessEnergy += pairE;
                 }
             }
         }
 
         if (isRepusive || callbacks.isNonPairwise)
         {
+            // Full Metropolis acceptance: exp(-(E_new - E_old)).
+            // Covers ALL cluster-environment pair energy changes including SL-skipped pairs
+            // (thesis step 7). Broken backbone bonds give ΔE ≈ +992 → rejection probability ≈ 1.
+            excessEnergy -= E_old;
             if (rng() > exp(-excessEnergy)) return false;
         }
 
@@ -793,6 +825,21 @@ namespace vmmc
             std::vector<double> v2(dimension);
 
             // Calculate coordinates relative to the global rotation point.
+            // Use clusterPosition, which builds a consistent "unfolded" coordinate frame along
+            // the recruitment chain: clusterPos[q] = clusterPos[p] + minImage(q - p) for every
+            // directly-recruited pair (p→q). This guarantees v1[a] - v1[b] = minImage(a - b) for
+            // bonded cluster members, so the rotation R preserves their bond distance exactly:
+            //   |R(v1_a) - R(v1_b)| = |v1_a - v1_b| = |minImage(a - b)| = original distance. ✓
+            //
+            // DO NOT apply while-loop min-image correction here: it reduces each particle's v1
+            // independently, and when two bonded partners straddle the ±W/2 boundary one gets
+            // corrected and the other does not, creating an inconsistency (v1 difference ~W instead
+            // of ~1) that causes the rotation to place them ~W apart.
+            //
+            // Any PBC wrapping needed on the final post-move position is handled by
+            // applyPeriodicBoundaryConditions, called below. If the unfolded v1 is very large (chain
+            // winds many times around y), the resulting x-position may be < 0 and the boundary
+            // callback will reject the move — a conservative false-rejection, not a correctness bug.
             for (unsigned int i=0;i<dimension;i++)
                 v1[i] = particles[particle].clusterPosition[i] - particles[moveParams.seed].clusterPosition[i];
 
@@ -837,17 +884,32 @@ namespace vmmc
             }
         }
 
-        // Apply periodic boundary conditions.
-        applyPeriodicBoundaryConditions(postMoveParticle.postMovePosition);
+        // Apply periodic boundary conditions to periodic dimensions only.
+        // Dimension 0 (x) is non-periodic (hard-wall boundary at x=0): do NOT wrap it.
+        // Wrapping x corrupts postMovePosition when large accumulated clusterPosition values
+        // push postPos[x] negative; the boundary callback (pos[0]<-0.5) already rejects those
+        // moves, but the corrupted position would then be used in reverse-link-weight computations
+        // for other particles in the same cluster, causing wrong energies and possible d=0 overlaps.
+        for (unsigned int i=1;i<dimension;i++) {
+            if (postMoveParticle.postMovePosition[i] < 0)
+                postMoveParticle.postMovePosition[i] += boxSize[i];
+            else if (postMoveParticle.postMovePosition[i] >= boxSize[i])
+                postMoveParticle.postMovePosition[i] -= boxSize[i];
+        }
 
         // MHC: snap to integer lattice sites after rotation to remove floating-point
         // residuals from sin/cos (e.g. cos(π/2) ≈ 6e-17 instead of 0).
-        // Re-apply PBC after rounding because round(11.9999...) = 12 can equal boxSize.
+        // Re-apply PBC (periodic dims only) after rounding: round(11.9999...) = 12 can equal boxSize.
         if (isLattice && moveParams.isRotation)
         {
             for (unsigned int i=0;i<dimension;i++)
                 postMoveParticle.postMovePosition[i] = round(postMoveParticle.postMovePosition[i]);
-            applyPeriodicBoundaryConditions(postMoveParticle.postMovePosition);
+            for (unsigned int i=1;i<dimension;i++) {
+                if (postMoveParticle.postMovePosition[i] < 0)
+                    postMoveParticle.postMovePosition[i] += boxSize[i];
+                else if (postMoveParticle.postMovePosition[i] >= boxSize[i])
+                    postMoveParticle.postMovePosition[i] -= boxSize[i];
+            }
         }
     }
 
@@ -917,8 +979,14 @@ namespace vmmc
                     // Make sure link hasn't been tested already.
                     if (!particles[neighbour].isMoving)
                     {
-                        // Pre-move pair energy (must be computed before SL check so that
-                        // backbone bonds can bypass the SL type-filter below).
+                        // SL mode: if a particle of the same type is already in the cluster,
+                        // treat this neighbour as environment (do not link it in).
+                        // SL-skipped pairs are captured in the step-7 Metropolis acceptance,
+                        // so no backbone bypass is needed here.
+                        if (isSLMove && slN0 > 1 && slTypeInCluster[(int)neighbour % slN0])
+                            continue;
+
+                        // Pre-move pair energy.
 #ifndef ISOTROPIC
                         double initialEnergy = callbacks.pairEnergyCallback(particle,
                             &particles[particle].preMovePosition[0], &particles[particle].preMoveOrientation[0],
@@ -927,14 +995,6 @@ namespace vmmc
                         double initialEnergy = callbacks.pairEnergyCallback(particle, &particles[particle].preMovePosition[0],
                             neighbour, &particles[neighbour].preMovePosition[0]);
 #endif
-
-                        // SL mode: if a particle of the same type is already in the cluster,
-                        // treat this neighbour as environment (do not link it in).
-                        // Backbone bonds (energy << -500) are exempt: they must always be
-                        // evaluated to prevent polymers from being torn apart by SL moves.
-                        if (isSLMove && slN0 > 1 && slTypeInCluster[(int)neighbour % slN0]
-                            && initialEnergy > -500.0)
-                            continue;
 
                         // Post-move pair energy.
 #ifndef ISOTROPIC

@@ -61,7 +61,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include <queue>
 #include <set>
 #include <algorithm>
 
@@ -110,16 +109,6 @@ inline double targetDistSqd(int id1, int id2) {
     return dx*dx + dy*dy;
 }
 
-// ============================================================
-//  Injection-site offsets from the condensate centre.
-//  One particle per site, assigned to consecutive polymer segments.
-//    Site 0 (East):  (+1, 0)
-//    Site 1 (North): ( 0,+1)
-//    Site 2 (West):  (-1, 0)
-//    Site 3 (South): ( 0,-1)
-// ============================================================
-static const int INJ_DX[4] = { 1,  0, -1,  0 };
-static const int INJ_DY[4] = { 0,  1,  0, -1 };
 
 // ============================================================
 //  Build coupling matrices (16×16, same as column model)
@@ -217,47 +206,6 @@ static void placeParticlesInitial(vector<Particle>& particles,
     }
 }
 
-// ============================================================
-//  Check if all 4 injection sites are unoccupied.
-// ============================================================
-static bool injectionSitesFree(const vector<Particle>& particles,
-                                double cx, double cy)
-{
-    for (const auto& p : particles) {
-        for (int k = 0; k < 4; k++) {
-            int sx = (int)round(cx) + INJ_DX[k];
-            int sy = (int)round(cy) + INJ_DY[k];
-            if ((int)round(p.position[0]) == sx &&
-                (int)round(p.position[1]) == sy)
-                return false;
-        }
-    }
-    return true;
-}
-
-// ============================================================
-//  Place one polymer group at the 4 injection sites.
-//  polymer_particles: exactly 4 global indices, in polymer order
-//  (segment 0 → East, 1 → North, 2 → West, 3 → South).
-// ============================================================
-static void injectPolymer(
-    vector<Particle>& particles, CellList& cells, Box& box,
-    const vector<int>& polymerParticles,
-    double cx, double cy,
-    vmmc::VMMC& vmmc)
-{
-    for (int k = 0; k < N_SEG && k < (int)polymerParticles.size(); k++) {
-        int gi = polymerParticles[k];
-        double newX = cx + INJ_DX[k];
-        double newY = cy + INJ_DY[k];
-        particles[gi].position[0] = newX;
-        particles[gi].position[1] = newY;
-        box.periodicBoundaries(particles[gi].position);
-        int newCell = cells.getCell(particles[gi]);
-        cells.updateCell(newCell, particles[gi], particles);
-        vmmc.syncPosition(gi, &particles[gi].position[0]);
-    }
-}
 
 // ============================================================
 //  Interaction-graph connected components (BFS over pair energy).
@@ -302,20 +250,30 @@ static int buildComponents(CondensateModel& model,
 }
 
 // ============================================================
-//  Check exit condition and populate the injection queue.
-//  Returns number of components recycled this step.
+//  Check exit condition and immediately re-place exiting particles.
+//
+//  Any isolated component with all particles at r > R_c is recycled:
+//  its particles are sorted into polymer groups and re-placed as
+//  denatured horizontal chains near the condensate centre, searching
+//  outward from cx+1 for free lattice sites.  This mirrors the
+//  column model's checkAndReplace and avoids the double-recycling
+//  bug that would arise from a queue-based scheme (particles at
+//  r > R_c would be re-queued every step until injection).
+//
+//  Returns number of complete complexes (N0 particles) that exited.
 // ============================================================
-static int checkAndRecycle(CondensateModel& model,
+static int checkAndReplace(CondensateModel& model,
                             vector<Particle>& particles,
                             int nParticles,
+                            CellList& cells, Box& box,
                             double cx, double cy, double R_c,
-                            queue<vector<int>>& injQueue)
+                            vmmc::VMMC& vmmc)
 {
     vector<int> fragmentID;
     vector<vector<int>> components;
     buildComponents(model, particles, nParticles, fragmentID, components);
 
-    int nRecycled = 0;
+    int nExited = 0;
     const int maxInt = 30;
     unsigned int nbrs[maxInt];
 
@@ -329,7 +287,7 @@ static int checkAndRecycle(CondensateModel& model,
         }
         if (!allOut) continue;
 
-        // Component must be isolated (no bonds to particles outside it).
+        // Component must be isolated.
         set<int> compSet(comp.begin(), comp.end());
         bool isolated = true;
         for (int gi : comp) {
@@ -347,32 +305,64 @@ static int checkAndRecycle(CondensateModel& model,
         }
         if (!isolated) continue;
 
-        // Split component into polymer groups and push to injection queue.
-        // Group key: (copy, polymer) = (gi/N0, (gi%N0)/N_SEG)
-        // Sort comp so that groups emerge in deterministic order.
+        if ((int)comp.size() == N0) nExited++;
+
+        // Sort by global id for deterministic placement.
         vector<int> sorted_comp = comp;
         sort(sorted_comp.begin(), sorted_comp.end());
 
-        // Build polymer groups.
-        // We rely on backbone bonds keeping polymers intact, so each polymer's
-        // 4 particles all exit together.  Gather by group key.
-        map<int, vector<int>> groups;
-        for (int gi : sorted_comp) {
-            int copy  = gi / N0;
-            int poly  = (gi % N0) / N_SEG;
-            int gkey  = copy * N_POLYMER + poly;
-            groups[gkey].push_back(gi);
-        }
-        for (auto& kv : groups) {
-            // Sort particles within group by local id so segment 0→3 is preserved.
-            sort(kv.second.begin(), kv.second.end(),
-                 [](int a, int b){ return (a % N0) < (b % N0); });
-            injQueue.push(kv.second);
+        // Build occupancy map excluding this component's particles.
+        set<int> replSet(sorted_comp.begin(), sorted_comp.end());
+        set<pair<int,int>> occ;
+        for (int i = 0; i < nParticles; i++) {
+            if (replSet.count(i)) continue;
+            occ.insert({(int)round(particles[i].position[0]),
+                        (int)round(particles[i].position[1])});
         }
 
-        nRecycled++;
+        int icx = (int)round(cx);
+        int icy = (int)round(cy);
+
+        // Group particles by polymer: key = copy*N_POLYMER + (local_id/N_SEG)
+        map<int, vector<int>> groups;
+        for (int gi : sorted_comp) {
+            int key = (gi / N0) * N_POLYMER + (gi % N0) / N_SEG;
+            groups[key].push_back(gi);
+        }
+
+        // Place each polymer group as a horizontal chain.
+        // Search outward from (cx+1, cy) for a free N_SEG-length row.
+        for (auto& kv : groups) {
+            auto& gids = kv.second;
+            sort(gids.begin(), gids.end(),
+                 [](int a, int b){ return (a % N0) < (b % N0); });
+
+            bool placed = false;
+            for (int dx = 1; dx <= 200 && !placed; dx++) {
+                for (int dy = -50; dy <= 50 && !placed; dy++) {
+                    int x0 = icx + dx, y0 = icy + dy;
+                    bool free = true;
+                    for (int s = 0; s < (int)gids.size() && free; s++)
+                        if (occ.count({x0 + s, y0})) free = false;
+                    if (!free) continue;
+
+                    for (int s = 0; s < (int)gids.size(); s++) {
+                        int gi = gids[s];
+                        particles[gi].position[0] = x0 + s;
+                        particles[gi].position[1] = y0;
+                        box.periodicBoundaries(particles[gi].position);
+                        int newCell = cells.getCell(particles[gi]);
+                        cells.updateCell(newCell, particles[gi], particles);
+                        vmmc.syncPosition(gi, &particles[gi].position[0]);
+                        occ.insert({x0 + s, y0});
+                    }
+                    placed = true;
+                }
+            }
+        }
     }
-    return nRecycled;
+
+    return nExited;
 }
 
 // ============================================================
@@ -417,7 +407,7 @@ int main(int argc, char** argv)
     double    phi_sl      = 0.2;
     double    phi_rot     = 0.2;
     string    outPrefix   = "condensate";
-    unsigned int seed     = 0;
+    unsigned int seed     = 1;  // default non-zero → always deterministic
 
     // --- Parse arguments ---
     for (int i = 1; i < argc; i++) {
@@ -531,7 +521,7 @@ int main(int argc, char** argv)
     double maxTrialRotation    = (phi_rot > 0.0) ? M_PI : 0.0;
     double probTranslate       = 1.0 - phi_rot;
     double referenceRadius     = 0.5;
-    bool   isRepulsive         = false;
+    bool   isRepulsive         = true;
     int    nLatticeNeighbours  = 8;
 
     using namespace std::placeholders;
@@ -563,9 +553,8 @@ int main(int argc, char** argv)
 
     vmmc.hydrAlpha = useStokes ? 1.0 : 0.0;
     if (seed != 0) vmmc.rng.setSeed(seed);
-
-    // --- Injection queue ---
-    queue<vector<int>> injQueue;
+    else { seed = std::random_device{}(); vmmc.rng.setSeed(seed); }
+    fprintf(stderr, "[SEED] %u\n", seed);
 
     // --- Open output files ---
     string trajFile = outPrefix + "_traj.txt";
@@ -576,7 +565,7 @@ int main(int argc, char** argv)
         cerr << "Cannot open output files.\n";
         return 1;
     }
-    fprintf(fp_stat, "# step  energy  nExited  queueSize  acceptRatio\n");
+    fprintf(fp_stat, "# step  energy  nExited  acceptRatio\n");
 
     // Write initial frame (step 0)
     double initEnergy = model.getEnergyExcludingCore();
@@ -593,18 +582,11 @@ int main(int argc, char** argv)
         // One outer iteration = nParticles VMMC move attempts
         vmmc += nParticles;
 
-        // Check for isolated components fully outside r = R_c; add their
-        // polymer groups to the injection queue.
-        int nRecycled = checkAndRecycle(model, particles, nParticles,
-                                         cx, cy, R_c, injQueue);
-        totalExited += nRecycled;
-
-        // Inject queued polymers if all 4 injection sites are free.
-        if (!injQueue.empty() && injectionSitesFree(particles, cx, cy)) {
-            vector<int> poly = injQueue.front();
-            injQueue.pop();
-            injectPolymer(particles, cells, box, poly, cx, cy, vmmc);
-        }
+        // Check for isolated components fully outside r = R_c; immediately
+        // re-place their particles as denatured chains near the centre.
+        int nExited = checkAndReplace(model, particles, nParticles,
+                                      cells, box, cx, cy, R_c, vmmc);
+        totalExited += nExited;
 
         double energy      = model.getEnergyExcludingCore();
         double acceptRatio = (double)vmmc.getAccepts() / (double)vmmc.getAttempts();
@@ -613,15 +595,14 @@ int main(int argc, char** argv)
         if (doSave) {
             writeFrame(fp_traj, particles, nCopies, R_c, cx, cy,
                        step, energy, totalExited, couplingStr);
-            fprintf(fp_stat, "%lld  %.4f  %lld  %d  %.4f\n",
-                    step, energy, totalExited, (int)injQueue.size(), acceptRatio);
+            fprintf(fp_stat, "%lld  %.4f  %lld  %.4f\n",
+                    step, energy, totalExited, acceptRatio);
         }
 
         if (step % max(1LL, nsteps/20) == 0) {
             cout << "  step " << step << "/" << nsteps
                  << "  E=" << energy
                  << "  exited=" << totalExited
-                 << "  queue=" << injQueue.size()
                  << "  accept=" << acceptRatio << "\n";
         }
     }

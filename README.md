@@ -9,20 +9,16 @@ annealing schedule.  Two condensate geometries are provided:
 
 | Binary | Geometry | Description |
 |---|---|---|
-| `run_nucleolus` | Column (rectangular) | Thesis model: linear gradient along x-axis, periodic y-axis, open at x > L. |
-| `run_condensate` | Circular | Extended model: radial gradient γ(r) = r/R_c, hard wall at centre, open at r > R_c with queue-based re-injection. |
-
-Additional general-purpose binaries (`run_hier`, `run_custom`, `run_polymer`)
-are described at the [bottom of this file](#hierarchical-assembly).
+| `run_nucleolus` | Column (rectangular) | Thesis model: linear gradient along x-axis, periodic y, open at x > L. |
+| `run_condensate` | Circular | Extension: radial gradient γ(r) = r/R_c, hard wall at centre, open at r > R_c with immediate re-placement. |
 
 ---
 
 ## Build
 
 ```bash
-mkdir -p obj       # once only
-make               # builds run_nucleolus and run_condensate
-make run_hier      # optional: general hierarchical assembly
+mkdir -p obj   # once only
+make           # builds run_nucleolus and run_condensate
 ```
 
 Requires a C++11 compiler (`g++`).  Python 3 with `numpy` and `matplotlib`
@@ -34,71 +30,148 @@ for visualisation.
 
 ### Target complex T
 
-Both simulations model the assembly of `nCopies = 4` copies of the same
-16-particle target complex T.  Each copy consists of 4 polymers × 4 segments
-arranged on a 4×4 grid following the n=2 Moore (space-filling) curve,
-partitioned into quadrants:
+Both simulations model 4 copies of the same 16-particle target complex T.
+Each copy consists of 4 polymers × 4 segments arranged on a 4×4 grid following
+the n = 2 Moore (space-filling) curve, partitioned into quadrants:
 
 ```
-Polymer 3: (0,2)(1,2)(1,3)(0,3)  |  Polymer 2: (2,2)(3,2)(3,3)(2,3)
-─────────────────────────────────┼──────────────────────────────────
-Polymer 0: (0,0)(1,0)(1,1)(0,1)  |  Polymer 1: (2,0)(3,0)(3,1)(2,1)
+Polymer 3: (0,2)(1,2)(1,3)(0,3)  │  Polymer 2: (2,2)(3,2)(3,3)(2,3)
+───────────────────────────────────┼────────────────────────────────────
+Polymer 0: (0,0)(1,0)(1,1)(0,1)  │  Polymer 1: (2,0)(3,0)(3,1)(2,1)
 ```
 
-### Interactions (J = 8, ε = 0.5)
+Global particle id = copy × 16 + local id (0–15).  Local id determines both
+polymer membership (local id / 4) and segment position within that polymer
+(local id % 4).
 
-All weak coupling is stored in 16×16 matrices indexed by local particle id
-(0–15), implementing a Gō model:
+### Backbone bonds
+
+Consecutive segments within each polymer are connected by a strong backbone
+bond (energy ≈ −1000, independent of the chemical gradient).  Backbone bonds
+are valid at distances d = 1 and d = √2 (diagonal), and are used as rigid
+connectors — they should never break during a simulation.
+
+### Weak coupling (Gō model)
+
+All weak coupling is stored in 16×16 matrices indexed by local particle id,
+implementing a Gō model with J = 8, ε = 0.5:
 
 | Condition | d = 1 | d = √2 | d = 2 |
 |---|---|---|---|
-| Same polymer type (δ_type = 1) | −J (repulsive) | −J | −εJ |
-| Cross-type, Gō neighbours at d=1 in T | +J (attractive) | — | — |
-| Cross-type, Gō neighbours at d=√2 in T | — | +εJ | — |
-| All other cross-type pairs | 0 | 0 | 0 |
+| Same polymer type | −J (repulsive) | −J | −εJ |
+| Cross-type, Gō neighbours at d = 1 in T | +J (attractive) | — | — |
+| Cross-type, Gō neighbours at d = √2 in T | — | +εJ | — |
+| Other cross-type pairs | 0 | 0 | 0 |
 
-Backbone bonds (consecutive segments within each polymer) use strongly
-attractive `Triple` entries (value ≈ 1000, never scaled by gradient).
+All weak couplings between particles i and j are multiplied by a coupling
+factor g that encodes the local chemistry (see Chemical gradient below).
 Hard-core overlap (d < 1) is always forbidden.
 
 ### Chemical gradient
 
-When `--gradient` is active all weak couplings between particles i and j are
-multiplied by a coupling factor g:
+When `--gradient` is active, weak couplings between particles i and j are
+multiplied by:
 
-**Column model:** `γ(x) = min(x/L, 1)` → g = γ(x_i) · γ(x_j)
+**Column model:** g = γ(x_i) · γ(x_j),   γ(x) = min(x/L, 1)
 
-**Circular model:** `γ(r) = min(r/R_c, 1)` where r is distance from centre.
-Two coupling modes are available:
-- `--coupling product` (default): g = γ(r_i) · γ(r_j) — consistent with thesis.
-- `--coupling midpoint`: g = γ(r_mid) where r_mid = |⟨pos_i + pos_j⟩/2 − centre| — more physically motivated; coupling depends on the local chemistry at the contact midpoint rather than the product of individual positions (Whitby thesis review, 2026).
+**Circular model:** g = γ(r_i) · γ(r_j),   γ(r) = min(r/R_c, 1)   (default `--coupling product`)
 
-Near the condensate core coupling is suppressed (denaturing conditions); full
-coupling is reached at x ≥ L or r ≥ R_c (physiological conditions).
+or with `--coupling midpoint`:  g = γ(|(pos_i + pos_j)/2 − centre|)
+
+Near the condensate core coupling is suppressed (denaturing conditions);
+full coupling is reached at x ≥ L or r ≥ R_c (physiological conditions).
+Assembled complexes drift toward the physiological zone and eventually exit.
+
+---
+
+## VMMC algorithm
+
+The simulation uses Virtual Move Monte Carlo (Whitelam & Geissler, J. Chem.
+Phys. 2007; Hedges 2015 implementation), extended for lattice models and
+Saturated Links.  Each outer iteration performs N_particles VMMC move
+attempts.
+
+### Move proposal
+
+A seed particle is chosen at random.  With probability φ_rot the move is a
+rotation; otherwise a translation.  On a square lattice, translations are
+to one of 8 neighbouring sites (4 cardinal + 4 diagonal).  Rotations are by
+90°, 180°, or 270° about the seed particle.  A random cluster size cut-off
+n_cut ~ 1/U[0,1] is sampled; the cluster must not exceed this size.
+
+### Cluster recruitment (steps 1–6)
+
+Starting from the seed, the algorithm recursively tries to recruit neighbouring
+particles into the moving cluster.  For each seed–neighbour pair (i, j):
+
+1. Compute the pre-move pair energy E_init = J(i_pre, j_pre).
+2. Compute the post-move energy as if j stayed fixed: E_fin = J(i_post, j_pre).
+3. Compute the reverse-move energy: E_rev = J(i_rev, j_pre).
+4. Forward link weight:  p_fwd = max(0, 1 − exp(E_init − E_fin))
+5. Reverse link weight:  p_rev = max(0, 1 − exp(E_init − E_rev))
+6. Draw r₁ ∈ [0,1].  If r₁ ≤ p_fwd:
+   - Draw r₂ ∈ [0,1].  If r₂ > p_rev/p_fwd, record a *frustrated link* and
+     stop searching from j.
+   - Otherwise recruit j into the cluster and recurse from j.
+
+Frustrated links signal that a reverse move would break a bond the forward
+move would not — the cluster cannot be accepted if any frustrated links remain
+external to it.
+
+Rotation moves use clusterPosition coordinates (an unfolded chain from the
+seed) to ensure the rigid-body rotation preserves all bond distances exactly,
+even for pairs that straddle the periodic y boundary.
+
+### Acceptance (step 7 — Metropolis)
+
+After the cluster is assembled, the move is accepted by:
+
+1. **Frustrated links:** reject if any remain (they are always external,
+   making the reverse cluster proposal impossible).
+
+2. **Stokes drag:** reject with probability 1 − (r_ref / r_eff) where r_eff
+   is the hydrodynamic radius of the cluster.  This implements D ∝ 1/R.
+
+3. **Full Metropolis acceptance:**
+
+   ```
+   ΔE = E_new − E_old
+   
+   E_old = Σ_{cluster i, env j} J(i_old, j_old)
+         + Σ_{cluster i < cluster j} J(i_old, j_old)
+   
+   E_new = Σ_{cluster i, env j} J(i_new, j_old)
+         + Σ_{cluster i < cluster j} J(i_new, j_old)
+   
+   p_accept = min(1, exp(−ΔE))
+   ```
+
+   The cluster–cluster term is included because the chemical gradient makes
+   pair energies depend on absolute x-position (via γ(x)), not just distance.
+   Even though rigid-body moves preserve all bond distances, J(i,j) changes
+   when x-positions change.  Omitting this term would break detailed balance
+   for translations or rotations along x.
+
+   For backbone bonds (distance-only, gradient-independent), the cluster–cluster
+   contribution cancels (ΔE_backbone = 0 for correct moves).  Including backbone
+   pairs in this sum is therefore harmless and also provides a safety catch for
+   any numerical inconsistency: a separated backbone pair gives ΔE ≈ +1000
+   and is rejected with probability ≈ 1.
 
 ### Saturated-Link (SL) moves
 
-A fraction `φ_SL` of VMMC steps are Saturated-Link moves.  During an SL move
-the algorithm records which of the 16 particle types are already in the moving
-cluster.  If a candidate neighbour's type is already represented, the
-recruitment link is skipped.  This removes kinetic trapping caused by the
-same-type repulsive couplings and is required for efficient sampling.
-Reference: Holmes-Cerfon & Wyart (2025), arXiv:2501.02611.
+A fraction φ_SL of move attempts are Saturated-Link moves.  During an SL
+move, a per-type occupancy array tracks which of the 16 particle types
+(type = global_id mod 16 = local position in the complex) are already
+in the cluster.  If a candidate neighbour's type is already occupied, the
+recruitment link is *skipped* rather than tested.
 
-### Hydrodynamics (--stokes)
+This prevents kinetic trapping in states where the same-type repulsion has
+locked multiple particles of the same local type into a stuck configuration.
+Because skipped pairs never form frustrated links, their contribution to the
+energy change is correctly handled by the step-7 Metropolis factor above.
 
-When `--stokes` is set the acceptance probability for cluster moves includes a
-Stokes drag factor:
-
-```
-scale = (r_ref / r_eff)^1   (translations)
-scale = (r_ref / r_eff)^3   (rotations)
-```
-
-where r_eff is the hydrodynamic radius of the moving cluster.  This approximates
-Brownian dynamics with diffusion D ∝ 1/R (Whitelam, Mol. Simul. 2011).
-Without `--stokes`, all cluster sizes diffuse equally.
-**Recommended for publication-quality dynamics comparison.**
+Reference: Holmes-Cerfon & Wyart, arXiv:2501.02611 (2025).
 
 ---
 
@@ -107,27 +180,28 @@ Without `--stokes`, all cluster sizes diffuse equally.
 ### Geometry
 
 ```
-x=0 (hard wall)           x=L (condensate edge)      →
-  |████████████████████████|·························
-  ← denatured zone ········→←·physiological zone····→
-  particles injected here   components exit here
+x=0 (hard wall)          x=L (condensate edge)
+  |████████████████████████|·························→
+  ←  denaturing zone  ·····→← physiological zone ···→
+  particles injected here    assemblies exit here
 ```
 
-The column has width W (periodic y), hard wall at x=0, and extends
-indefinitely in x.  A linear gradient γ(x) = x/L is active when `--gradient`
-is set.
+Width W is periodic in y.  The x dimension is non-periodic (hard wall at
+x = 0, open at x > L).  A linear gradient γ(x) = x/L is active when
+`--gradient` is set, suppressing weak coupling near x = 0.
 
 ### Removal and replacement
 
-After every outer iteration a BFS is run over the interaction graph.  A
-connected component is removed and reinserted if:
+After every outer iteration, a BFS is run over the interaction graph (edges
+where pair energy ≠ 0 and < 10⁵).  A connected component is removed and
+reinserted if:
 
-1. It contains exactly 16 particles (one complete complex worth).
+1. It contains exactly 16 particles (one complete assembled complex).
 2. All its particles satisfy x > L.
 3. It is isolated (no non-backbone bonds to particles outside the component).
 
-Removed particles are reinserted as 4 denatured horizontal chains near x=1,
-placed in the first free 4×4 block found scanning from x=1.
+The 16 particles are reinserted as 4 horizontal denatured polymer chains near
+x = 1, in the first free 4 × 4 block found scanning from x = 1 upward.
 
 ### Usage
 
@@ -137,7 +211,7 @@ placed in the first free 4×4 block found scanning from x=1.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--steps N` | 10000 | Total outer iterations (each = N_particles VMMC attempts). |
+| `--steps N` | 10000 | Total outer iterations (each = N_particles VMMC moves). |
 | `--snapshots N` | 1000 | Trajectory frames saved at even intervals. |
 | `--length L` | 60 | Column length in lattice units. |
 | `--width W` | 10 | Column width (periodic y period). |
@@ -146,17 +220,17 @@ placed in the first free 4×4 block found scanning from x=1.
 | `--phi-sl φ` | 0.2 | Fraction of SL moves. |
 | `--phi-rot φ` | 0.2 | Fraction of rotation moves. |
 | `--output PREFIX` | `nucleolus` | Output prefix → PREFIX_traj.txt, PREFIX_stats.txt. |
-| `--seed S` | 0 | RNG seed; 0 uses time-based seed. |
+| `--seed S` | 1 | RNG seed (0 = hardware random, non-reproducible). |
 
 ### Example
 
 ```bash
 ./run_nucleolus \
-    --steps 100000  --snapshots 1000 \
+    --steps 200000  --snapshots 1000 \
     --length 60     --width 10       \
     --gradient      --stokes         \
     --phi-sl 0.2    --phi-rot 0.2    \
-    --output my_column
+    --seed 2        --output my_column
 ```
 
 ### Visualisation
@@ -177,46 +251,37 @@ python3 visualize_nucleolus.py my_column_traj.txt \
 ### Geometry
 
 ```
-            (centre, hard wall at r=0)
-               ×  ← forbidden site
-             ┌─┼─┐
-             │ + │  ← 4 injection sites at r=1 (N,S,E,W)
-             └─┼─┘
-            (particles placed here when recycled)
+        × ← centre (r=0, hard-wall forbidden)
+       ···
+      ·····
+     ·······  ← R_c (condensate edge)
+      ·····
+       ···
 
-   ○ ← condensate edge at r = R_c
-   Particles diffuse outward from centre to edge.
-   Components fully outside r > R_c are recycled into the queue.
+Particles diffuse outward from centre driven by the radial gradient.
+When an isolated component exits at r > R_c, its particles are
+immediately re-placed as denatured chains near the centre.
 ```
 
-Key geometric rules:
+The condensate centre is at (cx, cy) = (R_large, R_large) in a large
+non-periodic box (both x and y are aperiodic).  The centre site itself
+is hard-wall forbidden via the VMMC boundary callback.
 
-1. **Centre (r = 0):** hard wall — the VMMC boundary callback prevents any
-   particle moving to (cx, cy).  This site is always empty.
+### Removal and replacement
 
-2. **Injection zone (r = 1):** the 4 cardinal sites at radius 1 from centre.
-   When ALL 4 sites are simultaneously empty and the injection queue is
-   non-empty, the next polymer group (4 particles) is placed there in a cross
-   pattern (site 0 = East, 1 = North, 2 = West, 3 = South).  Particles then
-   diffuse outward driven by the gradient (γ(r=1) ≈ 0).
+After every outer iteration, a BFS is run.  Any isolated component with all
+particles satisfying r > R_c is immediately re-placed:
 
-3. **Exit and recycling:** BFS is run after each outer iteration.  If ALL
-   particles in a connected component satisfy r > R_c and the component is
-   isolated, it is removed and its polymer groups are pushed onto the
-   injection queue.  Partial assemblies and fully assembled complexes are
-   treated identically — any connected unit that escapes is recycled.
+- Its particles are split into polymer groups by backbone connectivity
+  (global_id / N0 × N_POLYMER + (global_id % N0) / N_SEG).
+- Each polymer group (4 particles) is placed as a horizontal chain, searching
+  outward from (cx + 1) for free lattice sites.
+- Complete assembled complexes (exactly 16 particles) increment the exited
+  counter; partial assemblies are recycled transparently.
 
-4. **Queue:** the injection queue is a FIFO of polymer groups (4 particles
-   each, ordered by global id).  Groups are injected one at a time, gating
-   on the 4 injection sites being free.
-
-5. **No outer boundary:** the simulation box is large (radius ~6R_c) and
-   non-periodic in both x and y.  Escaped clusters can be far outside R_c
-   before all particles exit; the box is never reached in practice.
-
-6. **Energy reporting:** `getEnergyExcludingCore()` skips particles at r ≤ 1.5
-   from the centre so that transient injection-zone configurations do not
-   contaminate the energy trace.  The VMMC uses the full energy for dynamics.
+This immediate replacement (rather than a queue) ensures that recycled
+particles are never double-counted and do not interact spuriously with the
+in-condensate assembly while waiting for injection.
 
 ### Usage
 
@@ -235,36 +300,27 @@ Key geometric rules:
 | `--phi-sl φ` | 0.2 | Fraction of SL moves. |
 | `--phi-rot φ` | 0.2 | Fraction of rotation moves. |
 | `--output PREFIX` | `condensate` | Output prefix. |
-| `--seed S` | 0 | RNG seed. |
+| `--seed S` | 1 | RNG seed (0 = hardware random, non-reproducible). |
 
 ### Example
 
 ```bash
-# Gradient simulation with Stokes drag and product coupling
 ./run_condensate \
     --steps 200000  --snapshots 1000 \
     --radius 60     --gradient       \
     --stokes        --coupling product \
     --phi-sl 0.2    --phi-rot 0.2    \
-    --output circle_product
-
-# Midpoint coupling comparison run (same seed for fair comparison)
-./run_condensate \
-    --steps 200000  --snapshots 1000 \
-    --radius 60     --gradient       \
-    --stokes        --coupling midpoint \
-    --seed 42       \
-    --output circle_midpoint
+    --seed 1        --output my_circle
 ```
 
 ### Visualisation
 
 ```bash
-python3 visualize_condensate.py circle_product_traj.txt
+python3 visualize_condensate.py my_circle_traj.txt
 
 # Save to file:
-python3 visualize_condensate.py circle_product_traj.txt \
-        --output circle_product.gif --fps 10
+python3 visualize_condensate.py my_circle_traj.txt \
+        --output my_circle.gif --fps 10
 ```
 
 ---
@@ -282,68 +338,51 @@ step=S energy=E exited=X [geometry parameters]
 ...   (N_particles rows per frame)
 ```
 
-Column model header: `L=... W=... nCopies=...`
+Column model header: `L=... W=... nCopies=...`  
 Circular model header: `R_c=... cx=... cy=... nCopies=... coupling=...`
 
 ### `PREFIX_stats.txt` — scalar time series
 
-Tab-separated: `step  energy  nExited  [queueSize]  acceptRatio`
+```
+# step  energy  nExited  acceptRatio
+```
 
 ---
 
-## Known limitations and caveats
+## Reproducibility and seeding
 
-1. **`isRepulsive = false`:** The VMMC is constructed without the finite-
-   repulsion acceptance step (the `pairEnergyMatrix` mechanism).  Hard-core
-   overlaps (INF) are caught correctly.  Finite same-type repulsions (J = 8)
-   are included in the cluster link weights so repulsive neighbours are
-   correctly recruited into the moving cluster; however, the Boltzmann factor
-   in `accept()` does not explicitly account for net changes in finite
-   repulsive energy between the cluster and external particles.  For the
-   parameter values used (J = 8, gradient-suppressed near core) this is a
-   small systematic error.  A fully rigorous treatment would require
-   `isRepulsive = true`, which is left as a future extension.
+Both binaries default to `--seed 1` (fully deterministic).  Any given seed
+always produces an identical trajectory on the same hardware and compiler.
+Pass `--seed 0` for a hardware-random seed (non-reproducible across runs).
 
-2. **Product-form coupling:** The product form g = γ(r_i)·γ(r_j) is
-   consistent with the thesis column model but is physically questionable —
-   both particles at a contact point feel the same local chemistry.  The
-   midpoint form g = γ(r_mid) is physically better motivated.  The `--coupling`
-   flag in `run_condensate` allows direct comparison; inclusion of both modes
-   is recommended for publication.
-
-3. **2D model:** All simulations are 2D lattice models.  Extension to 3D
-   is identified as essential for a high-impact paper (Whitby thesis review,
-   2026).
-
-4. **VMMC time scale:** VMMC steps are not directly proportional to real time
-   unless Stokes drag is enabled and the relation D ∝ 1/R is justified for
-   the system.  Without `--stokes` all clusters diffuse equally, which
-   approximates a Rouse-like dynamics.
+**Note on seed-to-seed variance:** the number of exited complexes varies
+substantially between seeds — this is normal.  Some seeds lead to efficiently
+assembling trajectories; others get kinetically trapped in low-throughput
+states.  For publication-quality statistics, average over many seeds.
 
 ---
 
 ## Source layout
 
 ```
-makefile                   Build system (make builds run_nucleolus + run_condensate)
+makefile                   Build system
 run_nucleolus.cpp          Column condensate driver (thesis model)
 run_condensate.cpp         Circular condensate driver (extended model)
 visualize_nucleolus.py     Column model visualiser (animated 3-panel figure)
 visualize_condensate.py    Circular model visualiser (animated 3-panel figure)
 src/
-  VMMC.h / VMMC.cpp        Core VMMC algorithm (Hedges 2015, Holmes-Cerfon ext.)
-  StickySquare.h / .cpp    Lattice square-well model with patchy interactions
+  VMMC.h / VMMC.cpp        Core VMMC algorithm with step-7 Metropolis
   NucleolusModel.h / .cpp  Linear-gradient model (column geometry)
   CondensateModel.h / .cpp Radial-gradient model (circular geometry)
   Model.h / .cpp           Base class: cell-list energy, interactions, PBC
-  Box.h / .cpp             Simulation box with optional periodic boundaries
-  CellList.h / .cpp        Cell-list neighbour search
+  Box.h / .cpp             Simulation box (periodic or hard-wall boundaries)
+  CellList.h / .cpp        Cell-list neighbour search (interaction range 2.5)
   Particle.h / .cpp        Particle data structure
+  StickySquare.h / .cpp    Generic lattice square-well model
   Initialise.h / .cpp      Random initialisation utilities
   InputOutput.h / .cpp     File I/O helpers
   MersenneTwister.h        MT19937 RNG
 old/                       Deprecated files (not built)
-info.txt                   PhD thesis Chapter 2 (LaTeX source)
 ```
 
 ---
@@ -351,10 +390,10 @@ info.txt                   PhD thesis Chapter 2 (LaTeX source)
 ## Provenance
 
 The VMMC core is based on:
-> Hedges, L.O. (2015). *vmmc* — Virtual Move Monte Carlo.
+> Hedges, L.O. (2015). *vmmc* — Virtual Move Monte Carlo.  
 > [vmmc.xyz](http://vmmc.xyz/)
 
-Extended for lattice models and Saturated Links by Miranda Holmes-Cerfon.
+Extended for lattice models and Saturated Links by Miranda Holmes-Cerfon.  
 Reference:
 > Holmes-Cerfon, M. and Wyart, M. (2025). Hierarchical self-assembly for
 > high-yield addressable complexity at fixed conditions.
@@ -362,41 +401,3 @@ Reference:
 
 Nucleolus column and circular condensate models by Samuel Whitby (PhD thesis,
 Chapter 2, 2024–2026).
-
----
-
-## Hierarchical assembly
-
-`run_hier`, `run_custom`, and `run_polymer` are general-purpose Go-model
-polymer assembly binaries used for exploratory parameter scans and Boltzmann
-validation.  These are not the primary thesis models.
-
-### Quick start
-
-```bash
-make run_hier
-
-# 4-bead polymer, hard backbone, random weak couplings
-python run_and_plot.py --polymer 4 --L 12 --nsteps 100000 --nsweep 1 \
-  --e1 1000 --weak-e 1.0 --weak-std 0.5 --weak-seed 42 --sim-seed 7
-
-# 64-bead polymer with 3-level hierarchical bonds
-python run_and_plot.py --polymer 64 --L 20 --nsteps 200000 --nsweep 1 \
-  --hier-red 3.0 --hier-green 2.0 --hier-blue 1.0 --sim-seed 42
-
-# Parameter scan
-python scan_assembly.py scan_config.ini
-```
-
-Press **spacebar** to pause/resume the animation.
-
-### Polymer mode flags (summary)
-
-| Flag | Description |
-|---|---|
-| `--polymer N` | N-bead chain |
-| `--hier-red R --hier-green G --hier-blue B` | 3-level hierarchical couplings |
-| `--spring-k K` | Harmonic backbone (k=0 = rigid confinement) |
-| `--boltzmann` | Validate against Boltzmann distribution |
-| `--sim-seed N` | RNG seed |
-| `--prob-translate P` | Fraction of translation moves (default 1.0) |
