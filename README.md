@@ -10,7 +10,7 @@ annealing schedule.  Two condensate geometries are provided:
 | Binary | Geometry | Description |
 |---|---|---|
 | `run_nucleolus` | Column (rectangular) | Thesis model: linear gradient along x-axis, periodic y, open at x > L. |
-| `run_condensate` | Circular | Extension: radial gradient γ(r), hard wall at centre and ring, open at r > R_c with queue-based ring injection. |
+| `run_condensate` | Circular | Extension: radial gradient γ(r), hard wall at centre, soft repulsion at injection ring, open at r > R_c with queue-based ring injection. |
 
 ---
 
@@ -32,17 +32,23 @@ for visualisation.
 
 Both simulations model multiple copies of the same 16-particle target complex T.
 Each copy consists of 4 polymers × 4 segments arranged on a 4×4 grid following
-the n = 2 Moore (space-filling) curve, partitioned into quadrants:
+the n = 2 Moore (space-filling) curve, partitioned with an offset of 1 so that
+each polymer traces an L-shaped arm:
 
 ```
-Polymer 3: (0,2)(1,2)(1,3)(0,3)  │  Polymer 2: (2,2)(3,2)(3,3)(2,3)
-───────────────────────────────────┼────────────────────────────────────
-Polymer 0: (0,0)(1,0)(1,1)(0,1)  │  Polymer 1: (2,0)(3,0)(3,1)(2,1)
+y=3:  P0  P0  P0  P1        P0: (0,2)→(0,3)→(1,3)→(2,3)
+y=2:  P0  P2  P1  P1        P1: (3,3)→(3,2)→(2,2)→(2,1)
+y=1:  P2  P2  P1  P3        P2: (0,0)→(0,1)→(1,1)→(1,2)
+y=0:  P2  P3  P3  P3        P3: (3,1)→(3,0)→(2,0)→(1,0)
 ```
 
 Global particle id = copy × 16 + local id (0–15).  Local id determines both
 polymer membership (`local_id / 4`) and segment position within that polymer
 (`local_id % 4`).
+
+This partitioning ensures that Seg0 and Seg3 of every polymer are at distance
+√5 in the native structure (beyond the interaction range of all weak coupling
+terms), so the assembled target complex is the true energy minimum.
 
 ### Backbone bonds
 
@@ -274,8 +280,8 @@ real time.  Close the window or press Ctrl+C to stop.
 ### Geometry
 
 ```
-        × ← centre (r=0)
-       N·E   ← injection ring (N, E, S, W — hard wall)
+        × ← centre (r=0, hard wall)
+       N·E   ← injection ring (N, E, S, W — soft repulsion +1000 kT)
       S···W
      ·········  ← R_c (condensate edge, open boundary)
       ·······
@@ -286,10 +292,18 @@ The condensate is centred at (cx, cy) = (R_large, R_large) inside a large
 non-periodic box, where R_large = max(6 R_c, 150).  The radial gradient
 γ(r) = γ₀ + (1−γ₀)·r/R_c suppresses weak coupling near the centre.
 
-**Hard-wall zone:** the centre (r = 0) and its four cardinal neighbours
-(r² < 1.5 lattice units²) are forbidden to all VMMC moves.  This ring of
-5 sites is reserved for injection and is enforced via the VMMC boundary
-callback.
+**Hard-wall zone:** only the absolute centre site (r² < 0.5 lattice units²)
+is completely forbidden to all VMMC moves (boundary callback returns true).
+This prevents any particle from diffusing into r = 0.
+
+**Injection ring:** the four cardinal neighbours of the centre —
+N = (cx, cy+1), E = (cx+1, cy), S = (cx, cy−1), W = (cx−1, cy) —
+carry a strong nonpairwise repulsion of +1000 kT per occupied site (see
+[Ring-site repulsion](#ring-site-repulsion) below).  Unlike a hard wall,
+this allows the injection mechanism (which uses direct position assignment,
+not VMMC) to place freshly denatured polymers on these sites, while any
+spontaneous diffusion of other particles onto the ring is rejected with
+near-certainty by the VMMC Metropolis step.
 
 **Staging area:** polymers waiting for injection are held at
 x ≈ cx + 0.3·BOX (well outside R_c) in a fixed grid of slots.  Each
@@ -355,13 +369,55 @@ At most one polymer (4 segments) is injected per outer iteration.  If the
 ring is occupied — because a recently injected polymer has not yet diffused
 outward — injection is deferred to the next iteration.
 
+### Ring-site repulsion
+
+After injection, a freshly placed polymer occupies the four cardinal ring sites.
+Because each polymer's four segments are placed in a cross configuration (one
+per ring site), *any single-particle VMMC translation* will always carry at
+least one segment onto a ring site in a trial configuration that is worse than
+the current state, or off it to a site that is free — the move is therefore
+never blocked outright.  Without a repulsion on the ring sites, however, the
+polymer can remain pinned to those sites indefinitely: the four backbone bonds
+within the cross are at d = √2 (diagonal), giving a per-bond energy of −1000.
+Any translation puts one segment at d = 2 from its backbone partner
+(energy ≈ 0), raising the total by ≈ +1000.  Combined with the backbone energy
+of the cross configuration, the net ΔE for individual moves is frequently
+positive and the cluster-size cut-off prevents whole-polymer translations,
+causing the polymer to remain stuck.
+
+The solution is a **nonpairwise repulsion** of +1000 kT at each of the four
+ring sites.  This term enters the VMMC Metropolis factor (step 7) via
+`excessEnergy`:
+
+- Before the move: `excessEnergy -= nonPairwiseCallback(particle, pos_old, ori_old)`
+- After the move:  `excessEnergy += nonPairwiseCallback(particle, pos_new, ori_new)`
+
+Any translation that moves a segment *off* a ring site gains −1000 kT from the
+nonpairwise term, strongly favouring escape regardless of backbone energy.
+Any translation that moves a free particle *onto* a ring site costs +1000 kT
+and is rejected with near-certainty.
+
+**Detailed-balance caveat:** nonpairwise energies are not included in the
+cluster link weights (steps 1–6), only in the final Metropolis factor (step 7).
+This formally violates detailed balance for moves involving ring sites.  The
+violation is negligible in practice because +1000 kT >> kT: the Metropolis
+factor suppresses any ring-site occupation by ~e^{-1000} ≈ 0, so the affected
+region of phase space is never sampled in equilibrium.
+
+**Energy reporting:** the nonpairwise term is deliberately excluded from all
+energy values written to trajectory and statistics files.  `getSystemEnergy()`
+and `getEnergyExcludingCore()` sum only pair energies (backbone + weak
+coupling); nonpairwise energies are never included.  This keeps the reported
+energy interpretable as the assembly free energy without a large, invisible
+constant from any particles transiently sitting on ring sites during injection.
+
 ### Energy reporting
 
 All energy values reported in trajectory and statistics files are computed by
 `getSystemEnergy()`: the full pair-energy sum over all particles (including
-staged polymers in the staging area), with no exclusions.  This avoids the
-discontinuous jumps of ≈ 992 energy units that would occur if the injection
-zone were explicitly excluded from the sum.
+staged polymers in the staging area), excluding all nonpairwise terms.
+Nonpairwise terms (ring-site repulsion) never appear in reported energies;
+see [Ring-site repulsion](#ring-site-repulsion) above.
 
 Expected energy values per phase:
 - **Equil (g = 1):** ≈ −992 per backbone bond (3 per polymer × 16 polymers)

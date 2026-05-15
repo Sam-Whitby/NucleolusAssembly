@@ -61,14 +61,24 @@ extern double INF;
 extern double TOL;
 
 // ============================================================
-//  Target complex T  (n=2 Moore curve partitioned into 4 polymers)
+//  Target complex T  (n=2 Moore curve, offset-by-1 partition)
 //
-//  Positions on a 4×4 grid (x,y) where x is column and y is row:
+//  Each polymer traces an L-shaped arm of the 4×4 grid.
+//  Partition (1-indexed labels, y increasing upward):
 //
-//    Polymer 0 (local ids 0-3):   (0,0),(1,0),(1,1),(0,1)  bottom-left
-//    Polymer 1 (local ids 4-7):   (2,0),(3,0),(3,1),(2,1)  bottom-right
-//    Polymer 2 (local ids 8-11):  (2,2),(3,2),(3,3),(2,3)  top-right
-//    Polymer 3 (local ids 12-15): (0,2),(1,2),(1,3),(0,3)  top-left
+//    y=3:  1  1  1  2
+//    y=2:  1  3  2  2
+//    y=1:  3  3  2  4
+//    y=0:  3  4  4  4
+//
+//  Polymer 0 (local ids 0-3):   (0,2)(0,3)(1,3)(2,3)
+//  Polymer 1 (local ids 4-7):   (3,3)(3,2)(2,2)(2,1)
+//  Polymer 2 (local ids 8-11):  (0,0)(0,1)(1,1)(1,2)
+//  Polymer 3 (local ids 12-15): (3,1)(3,0)(2,0)(1,0)
+//
+//  All backbone bonds are at distance 1 (cardinal).
+//  Seg0 and Seg3 of every polymer are at distance sqrt(5):
+//  no intra-chain same-type repulsion in the native structure.
 //
 //  Backbone (within each polymer, consecutive segment pairs):
 //    (0,1),(1,2),(2,3) | (4,5),(5,6),(6,7) | (8,9),(9,10),(10,11) | (12,13),(13,14),(14,15)
@@ -79,8 +89,8 @@ static const int N_POLYMER = 4;  // polymers per complex
 static const int N_SEG     = 4;  // segments per polymer
 
 // Target positions for local ids 0..15
-static const int TARGET_X[N0] = { 0,1,1,0,  2,3,3,2,  2,3,3,2,  0,1,1,0 };
-static const int TARGET_Y[N0] = { 0,0,1,1,  0,0,1,1,  2,2,3,3,  2,2,3,3 };
+static const int TARGET_X[N0] = { 0,0,1,2,  3,3,2,2,  0,0,1,1,  3,3,2,1 };
+static const int TARGET_Y[N0] = { 2,3,3,3,  3,2,2,1,  0,1,1,2,  1,0,0,0 };
 
 // Backbone consecutive pairs within each polymer (local ids)
 static const int BACKBONE_PAIRS[][2] = {

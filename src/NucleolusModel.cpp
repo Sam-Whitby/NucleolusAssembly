@@ -86,6 +86,14 @@ double NucleolusModel::computePairEnergy(
     int id1 = (int)particle1 % n0;
     int id2 = (int)particle2 % n0;
 
+    // Particles belong to the same polymer chain when they share the same copy
+    // (global_id / n0) and the same polymer-within-copy (local_id / 4).
+    // Segments within one chain interact only via backbone bonds; all other
+    // weak coupling between them is suppressed to avoid spurious intra-chain
+    // repulsion that would make the native structure non-minimal.
+    bool sameChain = ((int)particle1 / n0 == (int)particle2 / n0) &&
+                     (id1 / 4 == id2 / 4);
+
     // Gradient scale factor for weak coupling.
     double g = gamma(position1[0]) * gamma(position2[0]);
 
@@ -111,8 +119,12 @@ double NucleolusModel::computePairEnergy(
         else
             energy += interactions.crosstalk;
 
-        // Weak d=1 coupling SCALED by gamma.
-        if (!interactions.weakD1.empty())
+        // Apply weak coupling for backbone pairs (preserves the E(d=1) vs
+        // E(d=√2) difference that VMMC needs to recruit backbone partners)
+        // and for all cross-chain pairs.  Suppress only for non-backbone
+        // intra-chain pairs (which would otherwise add spurious repulsion).
+        bool isBackbone = (backbone != Neighbours::cNone);
+        if ((isBackbone || !sameChain) && !interactions.weakD1.empty())
             energy += g * interactions.weakD1[id1][id2];
 
     } else if (normSqd < 2.0 + TOL) {
@@ -127,18 +139,18 @@ double NucleolusModel::computePairEnergy(
             // making VMMC link weight = 0 and allowing backbone partners to separate.
         } else {
             energy += interactions.crosstalk;
-            if (!interactions.weakDsq2.empty())
+            if (!sameChain && !interactions.weakDsq2.empty())
                 energy += g * interactions.weakDsq2[id1][id2];
         }
 
     } else if (normSqd < 4.0 + TOL) {
         // --- Distance 2 ---
-        if (!interactions.weakD2.empty())
+        if (!sameChain && !interactions.weakD2.empty())
             energy += g * interactions.weakD2[id1][id2];
 
     } else {
         // --- Distance sqrt(5) ---
-        if (!interactions.weakDsq5.empty())
+        if (!sameChain && !interactions.weakDsq5.empty())
             energy += g * interactions.weakDsq5[id1][id2];
     }
 

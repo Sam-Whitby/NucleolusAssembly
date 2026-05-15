@@ -67,20 +67,32 @@ extern double INF;
 extern double TOL;
 
 // ============================================================
-//  Target complex T  (n=2 Moore curve, same as column model)
+//  Target complex T  (n=2 Moore curve, offset-by-1 partition)
 //
-//  Polymer 0 (local ids 0-3):   (0,0)(1,0)(1,1)(0,1)  bottom-left
-//  Polymer 1 (local ids 4-7):   (2,0)(3,0)(3,1)(2,1)  bottom-right
-//  Polymer 2 (local ids 8-11):  (2,2)(3,2)(3,3)(2,3)  top-right
-//  Polymer 3 (local ids 12-15): (0,2)(1,2)(1,3)(0,3)  top-left
+//  Each polymer traces an L-shaped arm of the 4×4 grid.
+//  Partition (1-indexed labels, y increasing upward):
+//
+//    y=3:  1  1  1  2
+//    y=2:  1  3  2  2
+//    y=1:  3  3  2  4
+//    y=0:  3  4  4  4
+//
+//  Polymer 0 (local ids 0-3):   (0,2)(0,3)(1,3)(2,3)
+//  Polymer 1 (local ids 4-7):   (3,3)(3,2)(2,2)(2,1)
+//  Polymer 2 (local ids 8-11):  (0,0)(0,1)(1,1)(1,2)
+//  Polymer 3 (local ids 12-15): (3,1)(3,0)(2,0)(1,0)
+//
+//  All backbone bonds are at distance 1 (cardinal).
+//  Seg0 and Seg3 of every polymer are at distance sqrt(5):
+//  no intra-chain same-type repulsion in the native structure.
 // ============================================================
 
 static const int N0        = 16;
 static const int N_POLYMER = 4;
 static const int N_SEG     = 4;
 
-static const int TARGET_X[N0] = { 0,1,1,0,  2,3,3,2,  2,3,3,2,  0,1,1,0 };
-static const int TARGET_Y[N0] = { 0,0,1,1,  0,0,1,1,  2,2,3,3,  2,2,3,3 };
+static const int TARGET_X[N0] = { 0,0,1,2,  3,3,2,2,  0,0,1,1,  3,3,2,1 };
+static const int TARGET_Y[N0] = { 2,3,3,3,  3,2,2,1,  0,1,1,2,  1,0,0,0 };
 
 static const int BACKBONE_PAIRS[][2] = {
     {0,1},{1,2},{2,3},
@@ -602,13 +614,35 @@ int main(int argc, char** argv)
         [cx, cy, &staged](unsigned int pid, const double* pos, const double*) -> bool {
             double dx = pos[0] - cx;
             double dy = pos[1] - cy;
-            // Hard wall: centre + 4 cardinal sites are forbidden for all particles.
-            if (dx*dx + dy*dy < 1.5) return true;
+            // Hard wall: only the absolute centre site (d²<0.5) is forbidden.
+            // The 4 cardinal ring sites are repulsive via nonPairwiseCallback instead,
+            // so that injected polymers can escape but free diffusion is blocked.
+            if (dx*dx + dy*dy < 0.5) return true;
             // Staged particles are frozen: reject any VMMC move proposal.
             // This prevents drift that would cause staging-slot collisions.
             if (staged.count((int)pid)) return true;
             return false;
         };
+
+    // Soft repulsion at the 4 cardinal ring sites (N/E/S/W of centre).
+    // Returned energy is added to excessEnergy in the VMMC Metropolis step,
+    // so any cluster move that lands a particle on a ring site pays +1000 kT.
+    // Injection bypasses this via direct position assignment (not VMMC moves).
+    // This energy is excluded from system-energy reports (nonpairwise terms are
+    // never included in getSystemEnergy / getEnergyExcludingCore).
+    const double ringRepulsion = 1000.0;
+    int icx = (int)round(cx);
+    int icy = (int)round(cy);
+    callbacks.nonPairwiseCallback =
+        [icx, icy, ringRepulsion](unsigned int, const double* pos, const double*) -> double {
+            int px = (int)round(pos[0]) - icx;
+            int py = (int)round(pos[1]) - icy;
+            if ((px == 0 && (py == 1 || py == -1)) ||
+                (py == 0 && (px == 1 || px == -1)))
+                return ringRepulsion;
+            return 0.0;
+        };
+    callbacks.isNonPairwise = true;
 
     vmmc::VMMC vmmc(nParticles, dimension, coordinates.data(), orientations.data(),
                      maxTrialTranslation, maxTrialRotation,
