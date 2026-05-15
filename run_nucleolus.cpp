@@ -320,6 +320,42 @@ static bool replacementPlacement(
 }
 
 // ============================================================
+//  Reference energy of one perfectly assembled target complex (g = 1).
+//  See run_condensate.cpp for derivation.
+// ============================================================
+static double referenceComplexEnergy(double J, double eps, double bbEnergy)
+{
+    double E = (double)N_BB_PAIRS * -(bbEnergy - J);
+    for (int i = 0; i < N0; i++) {
+        for (int j = i+1; j < N0; j++) {
+            if (polyType(i) == polyType(j)) continue;
+            double dsqd = targetDistSqd(i, j);
+            if      (dsqd < 1.0 + 1e-6) E -= J;
+            else if (dsqd < 2.0 + 1e-6) E -= eps * J;
+        }
+    }
+    return E;
+}
+
+// Sum all pairwise energies within a component (each unordered pair counted once).
+static double componentPairEnergy(NucleolusModel& model,
+                                   const vector<int>& comp,
+                                   const vector<Particle>& particles)
+{
+    double E = 0.0;
+    for (int ii = 0; ii < (int)comp.size(); ii++) {
+        for (int jj = ii+1; jj < (int)comp.size(); jj++) {
+            int i = comp[ii], j = comp[jj];
+            double e = model.computePairEnergy(
+                i, &particles[i].position[0], &particles[i].orientation[0],
+                j, &particles[j].position[0], &particles[j].orientation[0]);
+            if (e < 1e5) E += e;
+        }
+    }
+    return E;
+}
+
+// ============================================================
 //  Interaction-graph connected components using computePairEnergy.
 //  Builds adjacency for ALL particles (not just within x>L).
 //  Returns fragmentID[i] = component id for particle i,
@@ -374,7 +410,8 @@ static int checkAndReplace(NucleolusModel& model,
                             vector<Particle>& particles,
                             CellList& cells, Box& box,
                             int nCopies, int W, int L_col,
-                            vmmc::VMMC& vmmc)
+                            vmmc::VMMC& vmmc,
+                            double refComplexEnergy)
 {
     int nParticles = nCopies * N0;
     vector<int> fragmentID;
@@ -410,9 +447,19 @@ static int checkAndReplace(NucleolusModel& model,
         if (!isolated) continue;
 
         // Recycle any isolated component past x=L regardless of size.
-        // Count toward exits only if it is a complete N0-particle complex.
+        // Count toward exits only if it is a complete N0-particle complex with
+        // all N0 distinct local ids AND pair energy matching the native structure
+        // (g=1).  Particles at x > L have γ(x) clamped to 1.0, so their energy
+        // equals the reference regardless of whether --gradient is active.
         if (replacementPlacement(particles, cells, box, comp, W, L_col, vmmc)) {
-            if ((int)comp.size() == N0) nReplaced++;
+            if ((int)comp.size() == N0) {
+                set<int> localIds;
+                for (int gi : comp) localIds.insert(gi % N0);
+                if ((int)localIds.size() == N0) {
+                    double E = componentPairEnergy(model, comp, particles);
+                    if (fabs(E - refComplexEnergy) < 0.5) nReplaced++;
+                }
+            }
         }
     }
     return nReplaced;
@@ -583,6 +630,10 @@ int main(int argc, char** argv)
                           maxInteractions, interactionEnergy, interactionRange,
                           interactions, (double)L_col, useGradient);
 
+    // Reference energy of one perfect complex (g=1, native geometry).
+    const double refComplexEnergy = referenceComplexEnergy(J, eps, bbEnergy);
+    cout << "Reference perfect-complex energy (g=1): " << refComplexEnergy << endl;
+
     // --- Place particles as denatured linear polymers near x=0 ---
     placeParticles(particles, cells, box, nCopies, W);
 
@@ -698,7 +749,7 @@ int main(int argc, char** argv)
 
         // Check for isolated components past x=L; remove and replace
         int nExited = checkAndReplace(model, particles, cells, box,
-                                       nCopies, W, L_col, vmmc);
+                                       nCopies, W, L_col, vmmc, refComplexEnergy);
         totalExited += nExited;
 
         // Backbone bond check: detect violations introduced by checkAndReplace.

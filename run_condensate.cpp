@@ -112,6 +112,49 @@ inline double targetDistSqd(int id1, int id2) {
 
 
 // ============================================================
+//  Reference energy of one perfectly assembled target complex (g = 1).
+//
+//  Contributions:
+//   - N_BB_PAIRS backbone bonds at d=1:  -(bbEnergy - J) each
+//     (backbone term + same-type weakD1 term at g=1)
+//   - Cross-polymer Gō contacts at d=1:  -J each
+//   - Cross-polymer Gō contacts at d=√2: -eps*J each
+//   - Same-chain non-backbone pairs: suppressed by sameChain guard → 0
+//   - crosstalk = 0 → no contribution
+// ============================================================
+static double referenceComplexEnergy(double J, double eps, double bbEnergy)
+{
+    double E = (double)N_BB_PAIRS * -(bbEnergy - J);
+    for (int i = 0; i < N0; i++) {
+        for (int j = i+1; j < N0; j++) {
+            if (polyType(i) == polyType(j)) continue;
+            double dsqd = targetDistSqd(i, j);
+            if      (dsqd < 1.0 + 1e-6) E -= J;
+            else if (dsqd < 2.0 + 1e-6) E -= eps * J;
+        }
+    }
+    return E;
+}
+
+// Sum all pairwise energies within a component (each unordered pair counted once).
+static double componentPairEnergy(CondensateModel& model,
+                                   const vector<int>& comp,
+                                   const vector<Particle>& particles)
+{
+    double E = 0.0;
+    for (int ii = 0; ii < (int)comp.size(); ii++) {
+        for (int jj = ii+1; jj < (int)comp.size(); jj++) {
+            int i = comp[ii], j = comp[jj];
+            double e = model.computePairEnergy(
+                i, &particles[i].position[0], &particles[i].orientation[0],
+                j, &particles[j].position[0], &particles[j].orientation[0]);
+            if (e < 1e5) E += e;
+        }
+    }
+    return E;
+}
+
+// ============================================================
 //  Build coupling matrices (16×16, same as column model)
 // ============================================================
 static void buildCouplingMatrices(
@@ -278,7 +321,8 @@ static pair<int,int> handleExitsAndQueue(
     vmmc::VMMC& vmmc,
     queue<vector<int>>& injQueue,
     set<int>& staged,
-    int stageX0)
+    int stageX0,
+    double refComplexEnergy)
 {
     vector<int> fragmentID;
     vector<vector<int>> components;
@@ -319,11 +363,18 @@ static pair<int,int> handleExitsAndQueue(
 
         particlesExited += (int)comp.size();
 
-        // Check for perfect assembly: all N0 distinct local ids present.
+        // A perfect complex: exactly N0 particles, all N0 distinct local ids
+        // present (one of each type from each of the 4 polymers), AND pair
+        // energy equals the reference native-structure energy (g=1).
+        // Particles at r > R_c have γ(r) clamped to 1.0, so their pair energy
+        // is the same as the reference regardless of phase or γ₀.
         if ((int)comp.size() == N0) {
             set<int> localIds;
             for (int gi : comp) localIds.insert(gi % N0);
-            if ((int)localIds.size() == N0) perfectExited++;
+            if ((int)localIds.size() == N0) {
+                double E = componentPairEnergy(model, comp, particles);
+                if (fabs(E - refComplexEnergy) < 0.5) perfectExited++;
+            }
         }
 
         // Group by polymer key and stage each polymer group.
@@ -574,6 +625,10 @@ int main(int argc, char** argv)
     // Start with fully assembled target complexes.
     placeParticlesTargetComplex(particles, cells, box, nCopies, cx, cy);
 
+    // Reference energy of one perfect complex (g=1, native geometry).
+    const double refComplexEnergy = referenceComplexEnergy(J, eps, bbEnergy);
+    cout << "Reference perfect-complex energy (g=1): " << refComplexEnergy << endl;
+
     // VMMC setup — use vectors for VLA-safety with runtime nParticles.
     vector<double> coordinates(dimension * nParticles);
     vector<double> orientations(dimension * nParticles);
@@ -686,7 +741,8 @@ int main(int argc, char** argv)
             vmmc += nParticles;
             pair<int,int> exitResult = handleExitsAndQueue(model, particles, nParticles,
                                                             cells, box, cx, cy, R_c, vmmc,
-                                                            injQueue, staged, stageX0);
+                                                            injQueue, staged, stageX0,
+                                                            refComplexEnergy);
             totalParticlesExited += exitResult.first;
             totalPerfectExited   += exitResult.second;
             tryInjectNext(particles, nParticles, cells, box, vmmc, cx, cy, injQueue, staged);

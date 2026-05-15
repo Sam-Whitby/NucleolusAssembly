@@ -216,8 +216,11 @@ reinserted if:
 2. It is isolated (no non-backbone bonds to particles outside the component).
 
 There is no restriction on component size: lone particles, partial assemblies,
-and complete 16-particle complexes are all recycled.  Only complete 16-particle
-recyclings increment the exited counter.
+and complete 16-particle complexes are all recycled.  The exited counter
+increments only for **perfect target complexes**: exactly 16 particles, all 16
+distinct local ids present, and pair energy equal to E_ref = −12 048 (the
+native-structure energy with g = 1; see Circular condensate — Perfect-complex
+reference energy for derivation).
 
 **Re-insertion (snake placement):** particles are grouped by polymer
 (local index / 4).  Each polymer chain (4 segments) is placed independently as
@@ -340,8 +343,34 @@ After every VMMC outer iteration:
 
 2. Qualifying components are counted:
    - `exitedParticles` increments by the component size.
-   - `exitedPerfect` increments by 1 if the component has exactly 16 particles
-     with all 16 distinct local ids (0–15) — a perfectly assembled complex.
+   - `exitedPerfect` increments by 1 if the component is a **perfect target
+     complex**, defined by all three conditions:
+     1. Exactly 16 particles.
+     2. All 16 distinct local ids (0–15) present — one segment from each of
+        the 4 polymers at each of the 4 positions.
+     3. Pair energy equals the reference native-structure energy (see below).
+     
+     Conditions 1–2 alone are insufficient: a set of 16 particles with all
+     distinct ids could be a misfolded or partially bonded complex.  Condition 3
+     confirms that all backbone bonds and all Gō contacts are formed in the
+     correct geometry.
+
+### Perfect-complex reference energy
+
+The pair energy of one fully assembled target complex with g = 1 is
+pre-computed analytically at startup from `TARGET_X`/`TARGET_Y` and the
+coupling parameters (J = 8, ε = 0.5, E_backbone = 1000):
+
+- 12 backbone bonds at d = 1:  −(E_backbone − J) = −992 each
+- 12 cross-polymer Gō contacts at d = 1:   −J = −8 each
+- 12 cross-polymer Gō contacts at d = √2:  −εJ = −4 each
+- Total: **E_ref = −12 048**
+
+Particles at r > R_c have γ(r) clamped to 1.0, so an exiting complex's pair
+energy equals E_ref regardless of the coupling mode, γ₀, or simulation phase.
+A component passes the energy check if |E − E_ref| < 0.5 (all energies are
+integer multiples of εJ = 4, so any missing or spurious bond shifts the energy
+by at least 4 units).
 
 3. Each qualifying component is split into polymer groups
    (all particles sharing the same copy index and polymer-within-copy index).
