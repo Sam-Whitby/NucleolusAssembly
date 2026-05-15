@@ -182,7 +182,6 @@ def _build_figure(grad_L, col_W, title, x_max=None):
                    extent=[0, grad_L, y_min, y_max],
                    origin="lower", aspect="auto",
                    cmap="Blues", alpha=0.20, zorder=0)
-    ax_anim.set_aspect("equal", adjustable="box")
     ax_anim.axvline(0,      color="black",     lw=1.5, zorder=1)
     ax_anim.axvline(grad_L, color="steelblue", lw=1.5, linestyle="--", zorder=1)
     ax_anim.text(grad_L + 0.3, y_min + 0.3, f"L={grad_L:.0f}",
@@ -192,6 +191,10 @@ def _build_figure(grad_L, col_W, title, x_max=None):
                  for t in range(4)],
         loc="upper right", fontsize=7, framealpha=0.7,
     )
+    # Apply equal aspect last so that imshow's aspect="auto" and legend/vlines
+    # don't override it.  adjustable="box" shrinks the axes box (not the data
+    # limits) to satisfy the constraint.
+    ax_anim.set_aspect("equal", adjustable="box")
 
     # --- Scalar panel labels ---
     ax_ener.set_xlabel("Step", fontsize=8)
@@ -269,52 +272,61 @@ def _update_particles(artists, ax_anim, fr):
 
 def live_mode(path, args, grad_L, col_W):
     """
-    Real-time viewer.  Polls the trajectory file every ~0.5 s and redraws
-    whenever a new frame appears.  No file is written; close the window or
-    press Ctrl+C to quit.
-    """
-    print(f"Live view — watching {path!r} for new frames.", flush=True)
-    print("Close the window or press Ctrl+C to quit.", flush=True)
+    Real-time viewer using FuncAnimation with an infinite frame generator.
 
-    plt.ion()
+    FuncAnimation owns the event loop (via plt.show), firing every `interval`
+    ms.  The generator yields the current frame list when new frames are
+    available, or None when the file hasn't changed.  This is more reliable
+    than a manual plt.pause() loop, which doesn't guarantee a canvas repaint
+    on macOS backends.
+    """
+    print(f"Live view — watching {path!r}.  Close the window to quit.", flush=True)
+
     fig, ax_anim, ax_ener, ax_exits = _build_figure(grad_L, col_W, args.title)
     artists = _init_artists(ax_anim, ax_ener, ax_exits)
-    fig.canvas.draw()
-    plt.pause(0.1)
 
-    seen = 0
-    try:
-        while plt.fignum_exists(fig.number):
+    seen = [0]  # list so the closure can mutate it
+
+    def frame_source():
+        """Infinite generator: yields all_frames on new data, None otherwise."""
+        while True:
             all_frames = parse_traj(path)
-
-            if len(all_frames) > seen:
-                seen = len(all_frames)
-                fr = all_frames[-1]
-
-                ts_steps  = [f['step']   for f in all_frames]
-                ts_energy = [f['energy'] for f in all_frames]
-                ts_exited = [f['exited'] for f in all_frames]
-
-                artists['ener_bg'].set_data(ts_steps, ts_energy)
-                artists['exits_bg'].set_data(ts_steps, ts_exited)
-                artists['ener_marker'].set_data([fr['step']], [fr['energy']])
-                artists['exits_marker'].set_data([fr['step']], [fr['exited']])
-                for ax in (ax_ener, ax_exits):
-                    ax.relim()
-                    ax.autoscale_view()
-                    if ts_steps:
-                        ax.set_xlim(min(ts_steps), max(ts_steps))
-
-                _update_particles(artists, ax_anim, fr)
-                fig.canvas.draw_idle()
-                plt.pause(0.05)
+            if len(all_frames) > seen[0]:
+                seen[0] = len(all_frames)
+                yield all_frames
             else:
-                plt.pause(0.5)
-    except KeyboardInterrupt:
-        pass
+                yield None
 
-    plt.ioff()
-    plt.show(block=True)
+    def update(all_frames):
+        if all_frames is None:
+            return  # nothing new; FuncAnimation redraws unchanged artists
+
+        fr = all_frames[-1]
+        ts_steps  = [f['step']   for f in all_frames]
+        ts_energy = [f['energy'] for f in all_frames]
+        ts_exited = [f['exited'] for f in all_frames]
+
+        artists['ener_bg'].set_data(ts_steps, ts_energy)
+        artists['exits_bg'].set_data(ts_steps, ts_exited)
+        artists['ener_marker'].set_data([fr['step']], [fr['energy']])
+        artists['exits_marker'].set_data([fr['step']], [fr['exited']])
+        for ax in (ax_ener, ax_exits):
+            ax.relim()
+            ax.autoscale_view()
+            if ts_steps:
+                ax.set_xlim(min(ts_steps), max(ts_steps))
+
+        _update_particles(artists, ax_anim, fr)
+
+    # Keep a reference to _ani: if it were garbage-collected the animation stops.
+    _ani = animation.FuncAnimation(  # noqa: F841
+        fig, update,
+        frames=frame_source(),
+        interval=500,          # poll every 500 ms
+        blit=False,
+        cache_frame_data=False,
+    )
+    plt.show()
 
 
 # --------------------------------------------------------------------------- #
