@@ -34,13 +34,16 @@ CondensateModel::CondensateModel(
     Interactions& interactions_,
     double cx_, double cy_, double R_c_,
     bool hasGradient_,
-    CouplingMode coupling_)
+    CouplingMode coupling_,
+    double gamma0_)
     : StickySquare(box_, particles_, cells_,
                    maxInteractions_, interactionEnergy_, interactionRange_,
                    interactions_),
       cx(cx_), cy(cy_), R_c(R_c_),
       hasGradient(hasGradient_),
-      coupling(coupling_)
+      coupling(coupling_),
+      gamma0(gamma0_),
+      phaseGOverride(-1)
 {
 }
 
@@ -48,7 +51,7 @@ double CondensateModel::gamma_r(double r) const
 {
     if (!hasGradient) return 1.0;
     if (R_c <= 0.0)   return 1.0;
-    double g = r / R_c;
+    double g = gamma0 + (1.0 - gamma0) * r / R_c;
     if (g < 0.0) g = 0.0;
     if (g > 1.0) g = 1.0;
     return g;
@@ -63,10 +66,11 @@ double CondensateModel::gamma_pos(const double* pos) const
 
 double CondensateModel::couplingFactor(const double* pos1, const double* pos2) const
 {
+    if (phaseGOverride == 0) return 1.0;   // equilibration: full coupling everywhere
+    if (phaseGOverride == 1) return 0.0;   // denaturation: no coupling everywhere
     if (coupling == CouplingMode::Product) {
         return gamma_pos(pos1) * gamma_pos(pos2);
     } else {
-        // Midpoint coupling: evaluate γ at the geometric midpoint of the pair.
         double mx = 0.5 * (pos1[0] + pos2[0]);
         double my = 0.5 * (pos1[1] + pos2[1]);
         double dx = mx - cx;

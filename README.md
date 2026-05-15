@@ -296,6 +296,18 @@ This immediate replacement (rather than a queue) ensures that recycled
 particles are never double-counted and do not interact spuriously with the
 in-condensate assembly while waiting for injection.
 
+### Simulation phases
+
+The simulation runs three sequential phases (all in outer iterations):
+
+| Phase | Flag | Default | Coupling | Purpose |
+|---|---|---|---|---|
+| Equilibration | `--t-equil N` | 0 | g = 1 everywhere | Let initially assembled complexes relax/diffuse. |
+| Denaturation | `--t-denat N` | 0 | g = 0 everywhere | Break complexes into denatured chains. |
+| Main | `--steps N` | 10000 | Radial gradient (or g=1 if `--gradient` not set) | Assembly / annealing run. |
+
+The system **starts with `--copies` fully assembled target complexes** arranged in a square grid near the condensate centre, spaced 3 lattice units apart (no inter-complex interactions).  `--snapshots` are distributed proportionally to each phase's duration.
+
 ### Usage
 
 ```
@@ -304,10 +316,14 @@ in-condensate assembly while waiting for injection.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--steps N` | 10000 | Total outer iterations. |
-| `--snapshots N` | 1000 | Trajectory frames saved. |
+| `--steps N` | 10000 | Main-phase outer iterations. |
+| `--snapshots N` | 1000 | Total trajectory frames across all phases. |
+| `--t-equil N` | 0 | Equilibration iterations (g=1 everywhere). |
+| `--t-denat N` | 0 | Denaturation iterations (g=0 everywhere). |
+| `--copies N` | 4 | Number of target complex copies. |
 | `--radius R` | 60 | Condensate radius in lattice units. |
-| `--gradient` | off | Enable radial gradient γ(r) = r/R_c. |
+| `--gamma0 γ` | 0.0 | Minimum coupling at r=0; γ(r)=γ₀+(1−γ₀)·r/R_c. |
+| `--gradient` | off | Enable radial gradient (otherwise g=1 in main phase). |
 | `--stokes` | off | Stokes drag (recommended). |
 | `--coupling MODE` | product | Coupling mode: `product` or `midpoint`. |
 | `--phi-sl φ` | 0.2 | Fraction of SL moves. |
@@ -319,8 +335,9 @@ in-condensate assembly while waiting for injection.
 
 ```bash
 ./run_condensate \
+    --copies 4      --t-equil 5000   --t-denat 20000  \
     --steps 200000  --snapshots 1000 \
-    --radius 60     --gradient       \
+    --radius 60     --gamma0 0.0     --gradient        \
     --stokes        --coupling product \
     --phi-sl 0.2    --phi-rot 0.2    \
     --seed 1        --output my_circle
@@ -346,18 +363,22 @@ Both simulations produce two files per run:
 
 ```
 <N_particles>
-step=S energy=E exited=X [geometry parameters]
+step=S energy=E [geometry and exit counters]
 <id> <poly_type> <x> <y> <copy>
 ...   (N_particles rows per frame)
 ```
 
-Column model header: `L=... W=... nCopies=...`  
-Circular model header: `R_c=... cx=... cy=... nCopies=... coupling=...`
+Column model header: `step=S energy=E exitedParticles=P exitedPerfect=Q L=... W=... nCopies=...`  
+Circular model header: `step=S energy=E exitedParticles=P exitedPerfect=Q R_c=... cx=... cy=... nCopies=... coupling=... gamma0=... phase=...`
+
+`exitedParticles` — cumulative total particles that left (any isolated component).  
+`exitedPerfect` — cumulative perfectly assembled complexes (all 16 distinct local types).  
+`phase` — which simulation phase produced this frame: `equil`, `denat`, or `main`.
 
 ### `PREFIX_stats.txt` — scalar time series
 
 ```
-# step  energy  nExited  acceptRatio
+# step  energy  exitedParticles  exitedPerfect  acceptRatio  phase
 ```
 
 ---

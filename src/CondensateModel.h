@@ -39,6 +39,8 @@ public:
     double R_c;             //!< Condensate radius in lattice units.
     bool   hasGradient;     //!< Whether the spatial gradient is active.
     CouplingMode coupling;  //!< Coupling mode (product or midpoint).
+    double gamma0;          //!< Minimum coupling at r=0 (default 0). γ(r)=γ0+(1-γ0)·r/R_c.
+    int    phaseGOverride;  //!< -1=normal, 0=equil (g=1 everywhere), 1=denat (g=0 everywhere).
 
     //! Constructor.
     CondensateModel(Box&, std::vector<Particle>&, CellList&,
@@ -48,7 +50,8 @@ public:
                     Interactions&,
                     double cx_, double cy_, double R_c_,
                     bool hasGradient_,
-                    CouplingMode coupling_);
+                    CouplingMode coupling_,
+                    double gamma0_ = 0.0);
 
     //! γ(r) — gradient coupling at radial distance r from the centre.
     double gamma_r(double r) const;

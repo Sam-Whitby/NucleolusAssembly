@@ -3,51 +3,38 @@
 
   Circular condensate assembly simulation — Chapter 2 extension.
 
-  Models the assembly of 4 copies of a 16-particle (n=2 Moore-curve) target
-  complex T inside a 2D circular condensate of radius R_c.  A radial chemical
-  gradient γ(r) = min(r/R_c, 1) scales all weak coupling strengths, making the
-  core denaturing (γ≈0 at r=0) and the surface physiological (γ=1 at r=R_c).
+  Models the assembly of nCopies copies of a 16-particle (n=2 Moore-curve)
+  target complex T inside a 2D circular condensate of radius R_c.
 
-  Geometry
-  --------
-  • Centre site (r = 0) is hard-wall forbidden (VMMC boundary callback).
-  • Injection zone: the 4 cardinal sites at r = 1 from the centre
-    {(cx+1,cy), (cx-1,cy), (cx,cy+1), (cx,cy-1)}.
-    When ALL 4 injection sites are simultaneously empty and the injection queue
-    is non-empty, the next polymer (4 particles in a cross pattern at r=1) is
-    placed there.
-  • Particles diffuse freely outward; there is no hard outer wall.  When ALL
-    particles of a connected component have r > R_c, the component is recycled:
-    its particles are removed from the lattice and each polymer group (4 particles
-    sharing a backbone) is appended to the injection queue.
-  • The "column edge" equivalent (x = L in the thesis) here is r = R_c.
+  Three simulation phases (all measured in outer iterations):
+    --t-equil N   Equilibration: g=1 everywhere; complexes are stable.
+    --t-denat N   Denaturation: g=0 everywhere; complexes fall apart.
+    --steps   N   Main run: radial gradient γ(r)=γ0+(1-γ0)·r/R_c.
 
-  Coupling modes (--coupling flag)
-  ---------------------------------
-  product   g = γ(r_i)·γ(r_j)          consistent with thesis
-  midpoint  g = γ(|(pos_i+pos_j)/2 − centre|)  more physical
+  The system starts with nCopies fully assembled target complexes placed in a
+  grid near the condensate centre, spaced 3 lattice units apart so they do not
+  interact.
 
-  Dynamics
-  --------
-  Stokes hydrodynamics (--stokes) is recommended for the best approximation to
-  Brownian dynamics (D ∝ 1/R per cluster, Whitelam 2011).  Without --stokes all
-  cluster sizes diffuse equally (unit diffusion, hydrAlpha = 0).
-
-  Usage
-  -----
-    ./run_condensate [options]
+  Exit tracking (two separate counters written to files):
+    exitedParticles   — cumulative particles that left (any component size)
+    exitedPerfect     — cumulative perfectly assembled complexes that left
+                        (all 16 distinct local types present)
 
   Options
-    --steps     N        total outer loop iterations                    [10000]
-    --snapshots N        number of trajectory snapshots                 [1000]
+    --steps     N        main-phase outer iterations                    [10000]
+    --snapshots N        total snapshots across all phases              [1000]
+    --t-equil   N        equilibration iterations                       [0]
+    --t-denat   N        denaturation iterations                        [0]
+    --copies    N        number of target complex copies                [4]
     --radius    R        condensate radius in lattice units             [60]
-    --gradient           enable radial chemical gradient γ(r) = r/R_c
+    --gamma0    γ        minimum coupling at r=0 (gradient floor)      [0.0]
+    --gradient           enable radial gradient (default: g=1 everywhere)
     --stokes             enable Stokes hydrodynamic drag (D ∝ 1/R)
     --coupling  MODE     gradient coupling: product or midpoint         [product]
     --phi-sl    φ        fraction of Saturated-Link moves               [0.2]
     --phi-rot   φ        fraction of rotation moves                     [0.2]
     --output    PREFIX   prefix for output files                        [condensate]
-    --seed      S        RNG seed (0 = time-based)                     [0]
+    --seed      S        RNG seed (0 = time-based)                     [1]
 */
 
 #include <cmath>
@@ -58,6 +45,7 @@
 #include <iostream>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -167,16 +155,15 @@ static void buildBackboneTriples(int nCopies, double bbEnergy,
 }
 
 // ============================================================
-//  Place all particles as denatured radial chains extending
-//  eastward from the centre, with a small radial offset so
-//  they start just outside the injection zone.
-//  polymer p of copy c starts at (cx + 1 + c*5, cy + p - N_POLYMER/2)
-//  with each segment extending eastward.
+//  Place all particles as fully assembled target complexes in a
+//  square grid centred at (cx, cy).  Adjacent complexes are offset
+//  by (N_SEG + 3) = 7 lattice units, giving a 3-unit gap so no
+//  inter-complex interactions occur (max interaction range = √5 < 3).
 // ============================================================
-static void placeParticlesInitial(vector<Particle>& particles,
-                                   CellList& cells, Box& box,
-                                   int nCopies,
-                                   double cx, double cy)
+static void placeParticlesTargetComplex(vector<Particle>& particles,
+                                         CellList& cells, Box& box,
+                                         int nCopies,
+                                         double cx, double cy)
 {
     cells.reset();
     int nParticles = nCopies * N0;
@@ -188,20 +175,25 @@ static void placeParticlesInitial(vector<Particle>& particles,
         particles[i].orientation[1] = 0.0;
     }
 
-    // Place nCopies×N_POLYMER polymer chains radiating outward in +x.
-    // Copy c, polymer p → x start = cx+1 + c*(N_SEG+1), y = cy + (p - N_POLYMER/2)
+    // Grid: nc_grid × nc_grid, each cell 7 units apart.
+    // Total grid span = nc_grid*7 - 3.  Centre the grid at (cx, cy).
+    int nc_grid = (int)ceil(sqrt((double)nCopies));
+    double span = nc_grid * 7 - 3;
+    double ox0  = round(cx) - span / 2.0;
+    double oy0  = round(cy) - span / 2.0;
+
     for (int c = 0; c < nCopies; c++) {
-        for (int p = 0; p < N_POLYMER; p++) {
-            int x0 = (int)round(cx) + 1 + c * (N_SEG + 2);
-            int y0 = (int)round(cy) + (p - N_POLYMER / 2);
-            for (int s = 0; s < N_SEG; s++) {
-                int gi = c * N0 + p * N_SEG + s;
-                particles[gi].position[0] = (double)(x0 + s);
-                particles[gi].position[1] = (double)y0;
-                box.periodicBoundaries(particles[gi].position);
-                particles[gi].cell = cells.getCell(particles[gi]);
-                cells.initCell(particles[gi].cell, particles[gi]);
-            }
+        int col = c % nc_grid;
+        int row = c / nc_grid;
+        double ox = ox0 + col * 7;
+        double oy = oy0 + row * 7;
+        for (int lid = 0; lid < N0; lid++) {
+            int gi = c * N0 + lid;
+            particles[gi].position[0] = ox + TARGET_X[lid];
+            particles[gi].position[1] = oy + TARGET_Y[lid];
+            box.periodicBoundaries(particles[gi].position);
+            particles[gi].cell = cells.getCell(particles[gi]);
+            cells.initCell(particles[gi].cell, particles[gi]);
         }
     }
 }
@@ -252,33 +244,28 @@ static int buildComponents(CondensateModel& model,
 // ============================================================
 //  Check exit condition and immediately re-place exiting particles.
 //
-//  Any isolated component with all particles at r > R_c is recycled:
-//  its particles are sorted into polymer groups and re-placed as
-//  denatured horizontal chains near the condensate centre, searching
-//  outward from cx+1 for free lattice sites.  This mirrors the
-//  column model's checkAndReplace and avoids the double-recycling
-//  bug that would arise from a queue-based scheme (particles at
-//  r > R_c would be re-queued every step until injection).
-//
-//  Returns number of complete complexes (N0 particles) that exited.
+//  Any isolated component with all particles at r > R_c is recycled.
+//  Returns {totalParticlesExited, perfectComplexesExited}.
+//  A "perfect complex" has exactly N0 particles with all N0 distinct
+//  local ids (0..N0-1), confirming correct assembly.
 // ============================================================
-static int checkAndReplace(CondensateModel& model,
-                            vector<Particle>& particles,
-                            int nParticles,
-                            CellList& cells, Box& box,
-                            double cx, double cy, double R_c,
-                            vmmc::VMMC& vmmc)
+static pair<int,int> checkAndReplace(CondensateModel& model,
+                                      vector<Particle>& particles,
+                                      int nParticles,
+                                      CellList& cells, Box& box,
+                                      double cx, double cy, double R_c,
+                                      vmmc::VMMC& vmmc)
 {
     vector<int> fragmentID;
     vector<vector<int>> components;
     buildComponents(model, particles, nParticles, fragmentID, components);
 
-    int nExited = 0;
+    int particlesExited = 0;
+    int perfectExited   = 0;
     const int maxInt = 30;
     unsigned int nbrs[maxInt];
 
     for (auto& comp : components) {
-        // All particles must be strictly outside the condensate.
         bool allOut = true;
         for (int gi : comp) {
             double dx = particles[gi].position[0] - cx;
@@ -287,7 +274,6 @@ static int checkAndReplace(CondensateModel& model,
         }
         if (!allOut) continue;
 
-        // Component must be isolated.
         set<int> compSet(comp.begin(), comp.end());
         bool isolated = true;
         for (int gi : comp) {
@@ -305,13 +291,19 @@ static int checkAndReplace(CondensateModel& model,
         }
         if (!isolated) continue;
 
-        if ((int)comp.size() == N0) nExited++;
+        particlesExited += (int)comp.size();
 
-        // Sort by global id for deterministic placement.
+        // Check for perfect assembly: all N0 distinct local ids present.
+        if ((int)comp.size() == N0) {
+            set<int> localIds;
+            for (int gi : comp) localIds.insert(gi % N0);
+            if ((int)localIds.size() == N0) perfectExited++;
+        }
+
+        // Re-place particles as denatured chains near the condensate centre.
         vector<int> sorted_comp = comp;
         sort(sorted_comp.begin(), sorted_comp.end());
 
-        // Build occupancy map excluding this component's particles.
         set<int> replSet(sorted_comp.begin(), sorted_comp.end());
         set<pair<int,int>> occ;
         for (int i = 0; i < nParticles; i++) {
@@ -323,15 +315,12 @@ static int checkAndReplace(CondensateModel& model,
         int icx = (int)round(cx);
         int icy = (int)round(cy);
 
-        // Group particles by polymer: key = copy*N_POLYMER + (local_id/N_SEG)
         map<int, vector<int>> groups;
         for (int gi : sorted_comp) {
             int key = (gi / N0) * N_POLYMER + (gi % N0) / N_SEG;
             groups[key].push_back(gi);
         }
 
-        // Place each polymer group as a horizontal chain.
-        // Search outward from (cx+1, cy) for a free N_SEG-length row.
         for (auto& kv : groups) {
             auto& gids = kv.second;
             sort(gids.begin(), gids.end(),
@@ -362,7 +351,7 @@ static int checkAndReplace(CondensateModel& model,
         }
     }
 
-    return nExited;
+    return {particlesExited, perfectExited};
 }
 
 // ============================================================
@@ -372,14 +361,18 @@ static int checkAndReplace(CondensateModel& model,
 // ============================================================
 static void writeFrame(FILE* fp, const vector<Particle>& particles,
                         int nCopies, double R_c, double cx, double cy,
-                        long long step, double energy, long long totalExited,
-                        const string& couplingLabel)
+                        long long step, double energy,
+                        long long exitedParticles, long long exitedPerfect,
+                        const string& couplingLabel, double gamma0,
+                        const string& phase)
 {
     int nParticles = (int)particles.size();
     fprintf(fp, "%d\n", nParticles);
     fprintf(fp,
-        "step=%lld energy=%.6f exited=%lld R_c=%.1f cx=%.1f cy=%.1f nCopies=%d coupling=%s\n",
-        step, energy, totalExited, R_c, cx, cy, nCopies, couplingLabel.c_str());
+        "step=%lld energy=%.6f exitedParticles=%lld exitedPerfect=%lld"
+        " R_c=%.1f cx=%.1f cy=%.1f nCopies=%d coupling=%s gamma0=%.4f phase=%s\n",
+        step, energy, exitedParticles, exitedPerfect,
+        R_c, cx, cy, nCopies, couplingLabel.c_str(), gamma0, phase.c_str());
     for (int i = 0; i < nParticles; i++) {
         int copy  = i / N0;
         int lid   = i % N0;
@@ -400,20 +393,27 @@ int main(int argc, char** argv)
     // --- Defaults ---
     long long nsteps      = 10000;
     long long nsnaps      = 1000;
+    long long t_equil     = 0;
+    long long t_denat     = 0;
+    int       nCopies     = 4;
     double    R_c         = 60.0;
+    double    gamma0      = 0.0;
     bool      useGradient = false;
     bool      useStokes   = false;
     string    couplingStr = "product";
     double    phi_sl      = 0.2;
     double    phi_rot     = 0.2;
     string    outPrefix   = "condensate";
-    unsigned int seed     = 1;  // default non-zero → always deterministic
+    unsigned int seed     = 1;
 
-    // --- Parse arguments ---
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i],"--steps")    && i+1<argc) { nsteps    = atoll(argv[++i]); }
         else if (!strcmp(argv[i],"--snapshots")&& i+1<argc) { nsnaps    = atoll(argv[++i]); }
+        else if (!strcmp(argv[i],"--t-equil")  && i+1<argc) { t_equil   = atoll(argv[++i]); }
+        else if (!strcmp(argv[i],"--t-denat")  && i+1<argc) { t_denat   = atoll(argv[++i]); }
+        else if (!strcmp(argv[i],"--copies")   && i+1<argc) { nCopies   = atoi(argv[++i]); }
         else if (!strcmp(argv[i],"--radius")   && i+1<argc) { R_c       = atof(argv[++i]); }
+        else if (!strcmp(argv[i],"--gamma0")   && i+1<argc) { gamma0    = atof(argv[++i]); }
         else if (!strcmp(argv[i],"--gradient"))              { useGradient = true; }
         else if (!strcmp(argv[i],"--stokes"))                { useStokes   = true; }
         else if (!strcmp(argv[i],"--coupling") && i+1<argc) { couplingStr = argv[++i]; }
@@ -422,8 +422,7 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i],"--output")   && i+1<argc) { outPrefix = argv[++i]; }
         else if (!strcmp(argv[i],"--seed")     && i+1<argc) { seed = (unsigned int)atoi(argv[++i]); }
         else {
-            cerr << "Unknown argument: " << argv[i] << "\n"
-                 << "Run ./run_condensate with no arguments to see defaults.\n";
+            cerr << "Unknown argument: " << argv[i] << "\n";
         }
     }
 
@@ -435,29 +434,39 @@ int main(int argc, char** argv)
         couplingStr = "product";
     }
 
-    if (nsnaps > nsteps + 1) nsnaps = nsteps + 1;
-    long long saveEvery = (nsnaps <= 1) ? nsteps : max(1LL, nsteps / (nsnaps - 1));
+    // Distribute snapshots proportionally across the three phases.
+    long long totalSteps  = t_equil + t_denat + nsteps;
+    long long snaps_equil = (totalSteps > 0 && t_equil > 0)
+                            ? max(1LL, nsnaps * t_equil / totalSteps) : 0;
+    long long snaps_denat = (totalSteps > 0 && t_denat > 0)
+                            ? max(1LL, nsnaps * t_denat / totalSteps) : 0;
+    long long snaps_main  = nsnaps - snaps_equil - snaps_denat;
+    if (snaps_main < 1) snaps_main = 1;
+
+    auto saveEvery = [](long long steps, long long snaps) -> long long {
+        if (steps <= 0 || snaps <= 0) return steps;
+        return max(1LL, steps / snaps);
+    };
+    long long saveEvery_equil = saveEvery(t_equil, snaps_equil);
+    long long saveEvery_denat = saveEvery(t_denat, snaps_denat);
+    long long saveEvery_main  = saveEvery(nsteps,  snaps_main);
 
     cout << "=== Circular Condensate Assembly Simulation ===" << endl;
-    cout << "  steps=" << nsteps << " snapshots=" << nsnaps
-         << "  R_c=" << R_c
+    cout << "  copies=" << nCopies
+         << "  t_equil=" << t_equil << " t_denat=" << t_denat << " steps=" << nsteps
+         << "  R_c=" << R_c << "  gamma0=" << gamma0
          << "  gradient=" << useGradient << " stokes=" << useStokes
          << "  coupling=" << couplingStr
          << "  phi_sl=" << phi_sl << " phi_rot=" << phi_rot << endl;
 
-    // --- Parameters ---
-    const int    nCopies    = 4;
     const int    nParticles = nCopies * N0;
     const double J          = 8.0;
     const double eps        = 0.5;
     const double bbEnergy   = 1000.0;
 
-    // Large box: particles are recycled at r > R_c, so the maximum radial
-    // extent before recycling is bounded by the largest possible cluster
-    // (~R_c + 10).  Using 6×R_c as the box half-width is very conservative.
     const double R_large = max(6.0 * R_c, 150.0);
-    const double cx = R_large;   // condensate centre x
-    const double cy = R_large;   // condensate centre y
+    const double cx = R_large;
+    const double cy = R_large;
     const double BOX = 2.0 * R_large;
 
     const unsigned int dimension       = 2;
@@ -466,11 +475,9 @@ int main(int argc, char** argv)
     const double interactionEnergy     = 0.0;
     const bool   isLattice             = true;
 
-    // --- Build coupling matrices ---
     vector<vector<double>> wD1, wDsq2, wD2, wDsq5;
     buildCouplingMatrices(J, eps, wD1, wDsq2, wD2, wDsq5);
 
-    // --- Build backbone Triples ---
     vector<Triple> north0, east0;
     buildBackboneTriples(nCopies, bbEnergy, north0, east0);
 
@@ -481,34 +488,31 @@ int main(int argc, char** argv)
                                wD1, wDsq2, wD2, wDsq5,
                                springK, bbPartners);
 
-    // --- Simulation box (square, non-periodic in both dimensions) ---
-    vector<double> boxSize   = { BOX, BOX };
+    vector<double> boxSize    = { BOX, BOX };
     vector<bool>   isPeriodic = { false, false };
     Box box(boxSize, isPeriodic);
     box.isLattice = true;
 
-    // --- Cell list ---
     CellList cells;
     cells.setDimension(dimension);
     cells.initialise(box.boxSize, interactionRange);
 
-    // --- Particles ---
     vector<Particle> particles(nParticles);
 
-    // --- Condensate model ---
     CondensateModel model(box, particles, cells,
                           maxInteractions, interactionEnergy, interactionRange,
                           interactions,
                           cx, cy, R_c,
-                          useGradient, couplingMode);
+                          useGradient, couplingMode, gamma0);
 
-    // --- Place particles as denatured radial chains near the centre ---
-    placeParticlesInitial(particles, cells, box, nCopies, cx, cy);
+    // Start with fully assembled target complexes.
+    placeParticlesTargetComplex(particles, cells, box, nCopies, cx, cy);
 
-    // --- VMMC setup ---
-    double coordinates[dimension * nParticles];
-    double orientations[dimension * nParticles];
-    bool   isIsotropic[nParticles];
+    // VMMC setup — use vectors for VLA-safety with runtime nParticles.
+    vector<double> coordinates(dimension * nParticles);
+    vector<double> orientations(dimension * nParticles);
+    // vector<bool> is a bitset specialisation with no .data(); use unique_ptr instead.
+    unique_ptr<bool[]> isIsotropic(new bool[nParticles]);
     for (int i = 0; i < nParticles; i++) {
         coordinates[2*i]   = particles[i].position[0];
         coordinates[2*i+1] = particles[i].position[1];
@@ -535,8 +539,6 @@ int main(int argc, char** argv)
     callbacks.postMoveCallback =
         std::bind(&CondensateModel::applyPostMoveUpdates, &model, _1, _2, _3);
 
-    // Hard wall at the centre site: reject any move that lands at r < 0.5
-    // (i.e. the single lattice site at (cx, cy) with r = 0).
     callbacks.boundaryCallback =
         [cx, cy](unsigned int, const double* pos, const double*) -> bool {
             double dx = pos[0] - cx;
@@ -544,10 +546,10 @@ int main(int argc, char** argv)
             return (dx*dx + dy*dy) < 0.5;
         };
 
-    vmmc::VMMC vmmc(nParticles, dimension, coordinates, orientations,
+    vmmc::VMMC vmmc(nParticles, dimension, coordinates.data(), orientations.data(),
                      maxTrialTranslation, maxTrialRotation,
                      probTranslate, referenceRadius,
-                     maxInteractions, &boxSize[0], isIsotropic, isRepulsive,
+                     maxInteractions, &boxSize[0], isIsotropic.get(), isRepulsive,
                      callbacks, isLattice, nLatticeNeighbours,
                      phi_sl, N0);
 
@@ -556,7 +558,6 @@ int main(int argc, char** argv)
     else { seed = std::random_device{}(); vmmc.rng.setSeed(seed); }
     fprintf(stderr, "[SEED] %u\n", seed);
 
-    // --- Open output files ---
     string trajFile = outPrefix + "_traj.txt";
     string statFile = outPrefix + "_stats.txt";
     FILE* fp_traj = fopen(trajFile.c_str(), "w");
@@ -565,51 +566,73 @@ int main(int argc, char** argv)
         cerr << "Cannot open output files.\n";
         return 1;
     }
-    fprintf(fp_stat, "# step  energy  nExited  acceptRatio\n");
+    fprintf(fp_stat, "# step  energy  exitedParticles  exitedPerfect  acceptRatio  phase\n");
 
-    // Write initial frame (step 0)
+    // Write step-0 frame (assembled, phase=equil or main depending on what follows).
     double initEnergy = model.getEnergyExcludingCore();
+    string firstPhase = (t_equil > 0) ? "equil" : (t_denat > 0) ? "denat" : "main";
     writeFrame(fp_traj, particles, nCopies, R_c, cx, cy,
-               0, initEnergy, 0, couplingStr);
-    fprintf(fp_stat, "0  %.4f  0  0  0.0000\n", initEnergy);
+               0, initEnergy, 0, 0, couplingStr, gamma0, firstPhase);
+    fprintf(fp_stat, "0  %.4f  0  0  0.0000  %s\n", initEnergy, firstPhase.c_str());
 
-    // --- Simulation loop ---
-    cout << "Starting simulation..." << endl;
     clock_t startTime = clock();
-    long long totalExited = 0;
+    long long globalStep          = 0;
+    long long totalParticlesExited = 0;
+    long long totalPerfectExited   = 0;
 
-    for (long long step = 1; step <= nsteps; step++) {
-        // One outer iteration = nParticles VMMC move attempts
-        vmmc += nParticles;
+    // Helper: run one phase of the simulation.
+    auto runPhase = [&](long long phaseSteps, long long saveEveryN, const string& phaseName) {
+        if (phaseSteps <= 0) return;
+        cout << "--- Phase: " << phaseName << "  (" << phaseSteps << " steps) ---" << endl;
+        for (long long s = 1; s <= phaseSteps; s++) {
+            vmmc += nParticles;
+            pair<int,int> exitResult = checkAndReplace(model, particles, nParticles,
+                                                        cells, box, cx, cy, R_c, vmmc);
+            totalParticlesExited += exitResult.first;
+            totalPerfectExited   += exitResult.second;
+            globalStep++;
 
-        // Check for isolated components fully outside r = R_c; immediately
-        // re-place their particles as denatured chains near the centre.
-        int nExited = checkAndReplace(model, particles, nParticles,
-                                      cells, box, cx, cy, R_c, vmmc);
-        totalExited += nExited;
+            double energy      = model.getEnergyExcludingCore();
+            double acceptRatio = (double)vmmc.getAccepts() / (double)vmmc.getAttempts();
 
-        double energy      = model.getEnergyExcludingCore();
-        double acceptRatio = (double)vmmc.getAccepts() / (double)vmmc.getAttempts();
+            bool doSave = (s % saveEveryN == 0) || (s == phaseSteps);
+            if (doSave) {
+                writeFrame(fp_traj, particles, nCopies, R_c, cx, cy,
+                           globalStep, energy,
+                           totalParticlesExited, totalPerfectExited,
+                           couplingStr, gamma0, phaseName);
+                fprintf(fp_stat, "%lld  %.4f  %lld  %lld  %.4f  %s\n",
+                        globalStep, energy,
+                        totalParticlesExited, totalPerfectExited,
+                        acceptRatio, phaseName.c_str());
+            }
 
-        bool doSave = (step % saveEvery == 0) || (step == nsteps);
-        if (doSave) {
-            writeFrame(fp_traj, particles, nCopies, R_c, cx, cy,
-                       step, energy, totalExited, couplingStr);
-            fprintf(fp_stat, "%lld  %.4f  %lld  %.4f\n",
-                    step, energy, totalExited, acceptRatio);
+            if (s % max(1LL, phaseSteps/10) == 0) {
+                cout << "  [" << phaseName << "] step " << s << "/" << phaseSteps
+                     << "  E=" << energy
+                     << "  exitParts=" << totalParticlesExited
+                     << "  exitPerfect=" << totalPerfectExited
+                     << "  accept=" << acceptRatio << "\n";
+            }
         }
+    };
 
-        if (step % max(1LL, nsteps/20) == 0) {
-            cout << "  step " << step << "/" << nsteps
-                 << "  E=" << energy
-                 << "  exited=" << totalExited
-                 << "  accept=" << acceptRatio << "\n";
-        }
-    }
+    // Phase 1: Equilibration — g=1 everywhere, complexes are stable.
+    model.phaseGOverride = 0;
+    runPhase(t_equil, saveEvery_equil, "equil");
+
+    // Phase 2: Denaturation — g=0 everywhere, complexes fall apart.
+    model.phaseGOverride = 1;
+    runPhase(t_denat, saveEvery_denat, "denat");
+
+    // Phase 3: Main simulation — gradient active (or g=1 if --gradient not set).
+    model.phaseGOverride = -1;
+    runPhase(nsteps, saveEvery_main, "main");
 
     double simTime = (clock() - startTime) / (double)CLOCKS_PER_SEC;
-    cout << "Done! Time = " << simTime << " s (" << simTime/60 << " min)" << endl;
-    cout << "Total recycled components: " << totalExited << endl;
+    cout << "Done! Time = " << simTime << " s (" << simTime/60.0 << " min)" << endl;
+    cout << "Total particles exited: " << totalParticlesExited << endl;
+    cout << "Perfect complexes exited: " << totalPerfectExited << endl;
     cout << "Acceptance ratio: "
          << (double)vmmc.getAccepts() / (double)vmmc.getAttempts() << endl;
 
