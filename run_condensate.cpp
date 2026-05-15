@@ -685,7 +685,14 @@ int main(int argc, char** argv)
     // Injection bypasses this via direct position assignment (not VMMC moves).
     // This energy is excluded from system-energy reports (nonpairwise terms are
     // never included in getSystemEnergy / getEnergyExcludingCore).
-    const double ringRepulsion = 1000.0;
+    // Ring-site repulsion: must be >> kT=1 (to block free diffusion) but
+    // << backbone energy ~992 (so it can never compensate a backbone break).
+    // With 1000 the Metropolis bonus exactly cancelled backbone penalties,
+    // allowing backbone bonds to be severed when VMMC's cluster-size cutoff
+    // silently left a backbone partner outside the cluster without a frustrated
+    // link.  50 >> kT keeps the barrier effective; 992-50=942 >> 0 ensures
+    // any backbone break is rejected regardless of ring-site state.
+    const double ringRepulsion = 50.0;
     int icx = (int)round(cx);
     int icy = (int)round(cy);
     callbacks.nonPairwiseCallback =

@@ -426,12 +426,30 @@ nonpairwise term, strongly favouring escape regardless of backbone energy.
 Any translation that moves a free particle *onto* a ring site costs +1000 kT
 and is rejected with near-certainty.
 
+**Ring-repulsion magnitude:** the ring-site repulsion is set to **+50 kT**,
+not +1000 kT.  Two constraints determine the correct range:
+
+- *Lower bound*: must be >> kT = 1 so that spontaneous diffusion onto ring
+  sites is negligible.  At +50 kT, exp(−50) ≈ 10⁻²² — fully effective.
+- *Upper bound*: must be << backbone bond energy ≈ 992 kT so that the
+  Metropolis bonus from leaving a ring site can never compensate a backbone
+  bond break.  With +50 the worst-case backbone break margin is
+  992 − 50 = 942 kT >> 0.
+
+Using +1000 kT violated the upper bound: VMMC's cluster-size cutoff can leave
+a backbone partner outside the cluster without creating a frustrated link
+(the `if (nMoving <= cutOff)` guard in `recursiveMoveAssignment` silently
+skips further recruitment once the cutoff is exceeded).  When this happened
+with a ring-site particle in the cluster, the −1000 kT nonpairwise exit bonus
+exactly cancelled the +992 kT backbone break penalty in the Metropolis factor,
+allowing backbone bonds to be severed.  Reducing to 50 makes this cancellation
+impossible while keeping the ring barrier fully effective.
+
 **Detailed-balance caveat:** nonpairwise energies are not included in the
 cluster link weights (steps 1–6), only in the final Metropolis factor (step 7).
 This formally violates detailed balance for moves involving ring sites.  The
-violation is negligible in practice because +1000 kT >> kT: the Metropolis
-factor suppresses any ring-site occupation by ~e^{-1000} ≈ 0, so the affected
-region of phase space is never sampled in equilibrium.
+violation is negligible in practice because +50 kT >> kT: the Metropolis
+factor suppresses any equilibrium ring-site occupation by ~e^{-50} ≈ 0.
 
 **Energy reporting:** the nonpairwise term is deliberately excluded from all
 energy values written to trajectory and statistics files.  `getSystemEnergy()`
